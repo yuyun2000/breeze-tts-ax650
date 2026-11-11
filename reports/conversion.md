@@ -23,7 +23,9 @@ lm_head logits cos 0.9999998。**重打包是精确等价映射，不是近似�
 |---|---|---|
 | talker（28 层 + post） | `llm_build --model_type qwen3`，bf16 hidden，kv 512，prefill 128×5 组，`--ret_postnorm`，`--parallel 10` | 24 分钟；28×~58 MB + post 4.6 MB = **1.633 GB**；post 输出 `output` BF16[1,1,2052] + `output_norm` BF16[1,1,2048] |
 | depth（12 层 + post） | `llm_build --model_type llama`，kv 32，prefill 16，`--ret_postnorm`，`--parallel 6` | 5 分钟；12×30.7 MB + post 74 KB = 369 MB |
-| 15 lm_head | `pulsar2 build`（INT8，Calib=64 组随机 post-norm hidden；见下"踩坑"） | 15×2.2 MB = 33 MB |
+| 15 lm_head（INT8 初版） | `pulsar2 build`（INT8，随机 hidden 校准；见下"踩坑"） | 15×2.2 MB = 33 MB（**输出 clamp 不可用**） |
+| 15 lm_head（U16 终版） | U16 激活 + 真实 per-head 校准（golden teacher-forced hidden） | 15×2.28 MB = 33 MB；unique 1662–1917、cos≥0.99996、top1 与 CPU fp32 一致 |
+| depth quality 档 | `llm_build --model_type llama -w bf16 --post_weight_type bf16`（FP32-heavy） | 12×111 MB + post 163 KB = 1.3 GB |
 | 文本编码器 | 两段静态 ONNX（T5Gemma2 26 层，L=128），INT8 → **不达标**（cos 0.45）→ U16/混合精度重建 | 见 textenc 报告 |
 
 ## 3. 踩坑

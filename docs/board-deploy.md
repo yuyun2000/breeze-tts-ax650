@@ -43,6 +43,12 @@ python3 runtime/run_breeze_tts.py \
 | depth decoder | `[proj(hidden_norm)]` + 15 步 × 12 层（llm_build --model_type llama）→ post(norm) → 15 个 lm_head | 每帧 15 步；KV cache 32，kv_dim 256 |
 | codec decode | codes [16,T] → decode_pre → 8 层 transformer(滑窗 72) → post → decode_post(t64 分块) | 复用 AXERA Qwen3-TTS speech_tokenizer axmodel |
 
+**fast / quality 两档**：默认 fast（talker + depth INT8 + U16 lm_head，RTF≈11–14×）；`--depth-mode hp`
+切 quality（depth FP32-heavy 1.3 GB，RTF≈23×）。15 个 lm_head 默认使用 `lm-head-hp/`（U16；
+旧 INT8 版输出被 clamp、argmax 会错，不要用于采样）。
+`demos/text_embeds/*.npz` 是 4 条 demo 的文本 embedding（文本编码器 NPU 版本待工具链修复期间的
+注入方式），`run.sh demo-*` 可回放。
+
 采样（与官方默认一致）：backbone temperature 0.9 / top_k 50 / 后掩码 2048–2050；depth 同步 15 步；
 EOS 只有 backbone 的 id **2051**（`vocab_size` 的额外类别）；EOS 帧整帧 pad(2050) 后截断。
 `cfg_scale=1.0`（Voice Design 默认不做 CFG）。

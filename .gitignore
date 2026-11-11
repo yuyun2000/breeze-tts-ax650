@@ -14,3 +14,5 @@ output*/
 __pycache__/
 *.pyc
 .env
+!reports/demos/*.wav
+!docs/**/*.wav

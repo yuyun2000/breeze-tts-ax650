@@ -9,7 +9,11 @@
     "num_codebooks": 16,
     "codebook_size": 2048,
     "audio_vocab_size": 2051,
-    "reserved_masked_ids": [2048, 2049, 2050]
+    "reserved_masked_ids": [
+      2048,
+      2049,
+      2050
+    ]
   },
   "talker": {
     "hidden_size": 2048,
@@ -41,7 +45,13 @@
     "intermediate_size": 8192,
     "rms_norm_eps": 1e-05,
     "rope_theta": 500000,
-    "rope_scaling": {"rope_type": "llama3", "factor": 32.0, "original_max_position_embeddings": 16, "high_freq_factor": 0.0078125, "low_freq_factor": 0.001953125},
+    "rope_scaling": {
+      "rope_type": "llama3",
+      "factor": 32.0,
+      "original_max_position_embeddings": 16,
+      "high_freq_factor": 0.0078125,
+      "low_freq_factor": 0.001953125
+    },
     "kv_cache_len": 32,
     "prefill_len": 16,
     "num_code_groups": 16,
@@ -50,7 +60,9 @@
     "post_axmodel": "llama_post.axmodel",
     "lm_head_pattern": "code_predictor_lm_head_{i}.axmodel",
     "projected_embed_table": "embeds/proj_audio_embed_16x2051x1024.bfloat16.bin",
-    "depth_proj": "embeds/depth_proj_2048x1024.bfloat16.bin"
+    "depth_proj": "embeds/depth_proj_2048x1024.bfloat16.bin",
+    "lm_head_hp_dir": "lm-head-hp",
+    "lm_head_note": "U16 lm_head (15 heads) 推荐；板端实测 top1 与 CPU fp32 一致、unique logits 1662-1917（INT8 只有 145-247），NPU 比 CPU heads 快 ~50ms/帧"
   },
   "text_encoder": {
     "hidden_size": 1152,
@@ -58,12 +70,17 @@
     "vocab_size": 262158,
     "seq_len": 128,
     "output_size": 2048,
-    "chunk1_axmodel": "text-encoder/textenc_L128_c1of2.axmodel",
-    "chunk2_axmodel": "text-encoder/textenc_L128_c2of2.axmodel",
     "embedding_lut": "text-encoder/text_embed_262158x1152.bfloat16.bin",
     "eoi_embedding": "text-encoder/eoi_embedding.npy",
     "embedding_scale": 33.941125,
-    "tokenizer_dir": "text-encoder/tokenizer"
+    "tokenizer_dir": "text-encoder/tokenizer",
+    "status": "npu_axmodel_not_delivered_pulsar2_axrope_fp32_bug",
+    "protocol": [
+      "inputs_embeds:float32[1,128,1152]",
+      "attention_mask:float32[1,128]",
+      "-> chunk1 -> [1,128,1152] -> chunk2 -> [1,128,2048]"
+    ],
+    "note": "NPU axmodel 受 Pulsar2 8.0 混合精度 AxRoPE 后端 bug 阻塞；demo/板端用 --text-embeds 注入参考 embedding（encode_text_embeds.py 可复现）"
   },
   "speech_tokenizer": {
     "decode_pre_axmodel": "speech-tokenizer/speech_tokenizer_decode_pre_inproj.axmodel",
@@ -75,14 +92,70 @@
     "source": "AXERA-TECH/Qwen3-TTS-12Hz-0.6B-Base-AX650 (speech_tokenizer), weights byte-identical to Qwen/Qwen3-TTS-Tokenizer-12Hz / Breeze audio_tokenizer"
   },
   "sampling": {
-    "backbone": {"do_sample": true, "temperature": 0.9, "top_k": 50, "top_p": 1.0, "repetition_penalty": 1.1},
-    "depth_decoder": {"do_sample": true, "temperature": 0.9, "top_k": 50, "top_p": 1.0},
+    "backbone": {
+      "do_sample": true,
+      "temperature": 0.9,
+      "top_k": 50,
+      "top_p": 1.0,
+      "repetition_penalty": 1.1
+    },
+    "depth_decoder": {
+      "do_sample": true,
+      "temperature": 0.9,
+      "top_k": 50,
+      "top_p": 1.0
+    },
     "max_frames": 120,
     "cfg_scale": 1.0,
     "mask_reserved_after_topk": true
   },
   "prompt": {
     "voice_design_template": "[S0]<ins_bos>{instruction}<ins_eos>{text}",
-    "special_token_ids": {"<bos>": 2, "<eos>": 1, "<pad>": 0, "[S0]": 262146, "<ins_bos>": 262156, "<ins_eos>": 262157, "<|AUDIO|>": 262144, "<|audio_eos|>": 262145}
-  }
+    "special_token_ids": {
+      "<bos>": 2,
+      "<eos>": 1,
+      "<pad>": 0,
+      "[S0]": 262146,
+      "<ins_bos>": 262156,
+      "<ins_eos>": 262157,
+      "<|AUDIO|>": 262144,
+      "<|audio_eos|>": 262145
+    }
+  },
+  "demo_files": [
+    {
+      "file": "demos/demo_zh_short.wav",
+      "text": "你好，欢迎体验 AX650 上的 Breeze TTS 语音合成。",
+      "mode": "fast/sampling",
+      "asr": "pass"
+    },
+    {
+      "file": "demos/demo_zh_long.wav",
+      "text": "今天天气不错，我们一起出去走走吧。你觉得去哪里比较好呢？",
+      "mode": "fast/sampling",
+      "asr": "pass"
+    },
+    {
+      "file": "demos/demo_en.wav",
+      "text": "Hello, welcome to Breeze TTS running on the AX650.",
+      "mode": "fast/sampling",
+      "asr": "pass"
+    },
+    {
+      "file": "demos/demo_zh2.wav",
+      "text": "深圳的秋天很舒服，周末我想去海边走走，顺便拍几张照片。",
+      "mode": "fast/sampling",
+      "asr": "pass"
+    },
+    {
+      "file": "demos/demo_zh_short_hp.wav",
+      "text": "同上短句",
+      "mode": "quality/fp32-depth",
+      "asr": "pass"
+    },
+    {
+      "file": "demos/reference/codec_parity_golden_short.wav",
+      "note": "同一份 golden codes 经板端 codec 解码，与 PyTorch 参考幅度谱相关 0.99958"
+    }
+  ]
 }

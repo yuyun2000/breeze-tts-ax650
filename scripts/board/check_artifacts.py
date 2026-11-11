@@ -53,16 +53,27 @@ def main():
     ap.add_argument("--cp-dir", default="")
     args = ap.parse_args()
     base = args.base
-    talker_dir = args.talker_dir or os.path.join(base, "builds/talker")
-    cp_dir = args.cp_dir or os.path.join(base, "builds/code-predictor")
+    def _first(*ps):
+        for p in ps:
+            if os.path.isdir(p):
+                return p
+        return ps[0]
+    talker_dir = args.talker_dir or _first(os.path.join(base, "builds/talker"),
+                                           os.path.join(base, "talker"))
+    cp_dir = args.cp_dir or _first(os.path.join(base, "builds/code-predictor"),
+                                   os.path.join(base, "code-predictor"))
+    cp_hp_dir = _first(os.path.join(base, "builds/code-predictor-hp"),
+                       os.path.join(base, "code-predictor-hp"))
+    lmhead_hp_dir = _first(os.path.join(base, "lm-head-hp"), os.path.join(base, "builds/lm-head-hp"))
     embeds_dir = os.path.join(base, "embeds")
-    textenc_dir = os.path.join(base, "textenc")
-    tok_dir = os.path.join(base, "tokenizer")
+    textenc_dir = _first(os.path.join(base, "text-encoder"), os.path.join(base, "textenc"))
+    tok_dir = _first(os.path.join(textenc_dir, "tokenizer"), os.path.join(base, "tokenizer"))
     all_ok = True
 
     print("== base:", base)
     print("== talker_dir:", talker_dir)
     print("== cp_dir:", cp_dir)
+    print("== cp_hp_dir:", cp_hp_dir, " lmhead_hp_dir:", lmhead_hp_dir)
 
     # ---------- talker
     print("\n--- talker ---")
@@ -121,6 +132,8 @@ def main():
             cplayers[int(m.group(1))] = p
     all_ok &= report("cp layers found: %d (expect 12)" % len(cplayers), len(cplayers) == 12)
     heads = sorted(glob.glob(os.path.join(cp_dir, "code_predictor_lm_head_*.axmodel")))
+    if lmhead_hp_dir and os.path.isdir(lmhead_hp_dir):
+        heads = sorted(glob.glob(os.path.join(lmhead_hp_dir, "code_predictor_lm_head_*.axmodel"))) or heads
     all_ok &= report("cp lm_heads found: %d (expect 15)" % len(heads), len(heads) == 15)
     if heads:
         hs = InferenceSession(heads[0])

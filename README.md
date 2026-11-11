@@ -1,98 +1,79 @@
 # Breeze TTS 2 on AX650
 
-把 [BreezeBlue/Breeze-TTS-2](https://huggingface.co/BreezeBlue/Breeze-TTS-2)（约 3.45 B 参数的中英双语 TTS，
-榜单第一的开源权重 TTS）转换并部署到 **AX650/AX8850** NPU 的可复现工程。
+把 [BreezeBlue/Breeze-TTS-2](https://huggingface.co/BreezeBlue/Breeze-TTS-2)（约 3.45 B 参数、中英双语、
+Artificial Analysis TTS 榜单开源第一）转换并部署到 **AX650/AX8850 NPU**：完整的转换流水线 +
+板端纯 Python 运行时（numpy + pyaxengine，无 PyTorch）+ 可复现实测报告。
 
-> ⚠️ **状态：进行中（2026-11-11 夜）**。本 README 会随转换/上板结果更新；数字以 `reports/` 与 `docs/` 里的实测报告为准。
-
+> 🤗 **模型包（axmodel + runtime，约 3.8 GB）**：<https://huggingface.co/yunyu1258/breeze-tts-2-ax650>
+>
 > ⚠️ **许可证**：Breeze TTS 2 的**模型权重、衍生模型与自托管输出仅限研究与非商业用途**
 > （BreezeBlue Research and Non-Commercial License 1.1，见 [licenses/BREEZEBLUE_LICENSE.txt](licenses/BREEZEBLUE_LICENSE.txt)）。
-> 本仓库的**代码**为 Apache-2.0（见 [licenses/APACHE-2.0.txt](licenses/APACHE-2.0.txt)）；
-> 本仓库发布的 axmodel 转换产物属于 Breeze 权重的**衍生模型**，同样受 BreezeBlue 非商业许可证约束，**不可商用**。
-> Qwen3-TTS tokenizer 相关组件来自 [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS)（Apache-2.0）。
-> AXERA 的工具链/现成编译产物版权归 AXERA，引用时注明来源。
+> 本仓库**代码**为 Apache-2.0（[LICENSE](LICENSE)）；本仓库/HF 发布的 axmodel 是 Breeze 权重的**衍生模型**，
+> 同样受 BreezeBlue 非商业许可证约束，**不可商用**。Qwen3-TTS tokenizer 组件版权归 QwenLM（Apache-2.0）；
+> 部分 codec 编译产物复用自 AXERA 公开仓库（见 [NOTICE](NOTICE)）。
 
----
+## 1. 做了什么
 
-## 1. 这是什么
-
-Breeze TTS 2 由四个部分组成，本工程把其中三部分搬上 AX650 NPU，并保留一个纯 Python 运行时：
-
-| 组件 | 原始结构 | 本工程做法 | 状态 |
+| 组件 | 原始结构 | AX650 部署方式 | 状态 |
 |---|---|---|---|
-| 文本编码器 | T5Gemma2 encoder（26 层，hidden 1152，双向） | 静态 ONNX → `pulsar2 build` INT8 axmodel | 待填 |
-| Backbone（talker） | Qwen3 式 28 层，hidden 2048，预测 codebook0 | 重打包成 Qwen3-TTS talker → `pulsar2 llm_build` 逐层 axmodel | 待填 |
-| Depth decoder | Llama 式 12 层，hidden 1024，预测 codebook1..15 | 重打包 → `pulsar2 llm_build` 逐层 axmodel + 15 个位置相关 lm_head | 待填 |
-| 音频 codec（vocoder） | Qwen3-TTS Tokenizer 12Hz（Mimi 系），24 kHz | **直接复用** AXERA 已编译的 Qwen3-TTS speech_tokenizer axmodel（权重与 Breeze 字节一致） | 待填 |
+| 文本编码器 | T5Gemma2 encoder（26L, hidden 1152, 双向） | 两段静态 ONNX → `pulsar2 build`；embedding 查表在 CPU（bf16 LUT mmap） | ⚠️ NPU 版本受工具链混合精度 bug 阻塞（见 §5），demo 用 golden text_embeds 注入 |
+| Backbone（talker） | Qwen3 式 28L，hidden 2048，预测 codebook0 | 重打包成 Qwen3ForCausalLM → `pulsar2 llm_build --model_type qwen3` 逐层 axmodel | ✅ NPU |
+| Depth decoder | Llama 式 12L，hidden 1024，预测 codebook1..15 | 重打包成 LlamaForCausalLM → `--model_type llama` 逐层 axmodel + 15 个 head | ✅ NPU |
+| 音频 codec | Qwen3-TTS Tokenizer 12Hz（Mimi 系），24 kHz | **直接复用 AXERA 已编译 Qwen3-TTS speech_tokenizer axmodel**（与 Breeze codec 权重字节一致） | ✅ NPU |
 
-板端运行时不依赖 PyTorch：`numpy + pyaxengine + tokenizers`，在 AX650（1.9 GB 系统内存）上跑通
-Voice Design（自然语言描述生成音色，无需参考音频）模式。
+**关键发现**：Breeze 顶层 config 的 llama3 rope 对 backbone 是死配置（backbone 走嵌套 `backbone_config`：
+qwen3 / θ=1e6 / 普通 RoPE）；只有 depth decoder 真正用 llama3 rope。Pulsar2 的 Qwen3-TTS 专用 model_type
+（mRoPE + 强制 qk-norm）与 Breeze 不匹配，通用 `qwen3` / `llama` model_type 才是精确路径。详见
+[docs/experience.md](docs/experience.md)。
 
-```
-text: "[S0]<ins_bos>{voice description}<ins_eos>{target text}"
-  → T5Gemma2 text encoder (NPU) → 2048-d embeddings
-  → talker prefill (NPU, 28 layers, chunked)
-  → autoregressive loop:
-       cb0 = sample(talker logits[2052])          # NPU post layer + CPU sample
-       cb1..cb15 = depth decoder 15 steps          # NPU, 12 layers + 15 lm_head
-       frame_emb = Σ_{g=0..15} E_g[cb_g]           # CPU embedding lookup
-       talker decode one token (NPU)
-  → 16×T codebook tokens
-  → speech_tokenizer decoder (NPU: decode_pre → 8 transformer layers → decode_post)
-  → 24 kHz wav
-```
+## 2. 板端实测（AX650C 真板）
 
-## 2. 目录
+| 项 | 结果 |
+|---|---|
+| talker decode | **133–146 ms/帧**（28 层 INT8，kv 512） |
+| depth decoder | **564–758 ms/帧**（15 步 × 12 层 INT8 + 15 个 lm_head CPU 兜底） |
+| codec decode | 522 ms（5.12 s 音频）/ 1249 ms（6.72 s） |
+| 整句端到端 | 短句 **72.2 s / 5.12 s = RTF 14.1×**；长句 **73.4 s / 6.72 s = RTF 10.9×** |
+| 资源 | CMM 3471 MB / 6144 MB；python RSS ~1.1 GB；模型加载 ~11 s |
+| 精度 | talker frame0 logits 与 PyTorch 参考 **top5 逐位一致**、output_norm cos 0.99942；codec 同 codes 幅度谱相关 0.99958 |
+| **ASR 验收** | 4 条 demo（中文短句/长句/英文/中文场景句）采样模式经 paraformer-zh + SenseVoice 转写**全部与输入文本一致**；hp 对照版本同样通过（见 `docs/ref/RUNTIME_REPORT.md`） |
 
-```
-scripts/convert/   转换脚本（在 Linux x86 转换机上跑）
-  text_encoder/    文本编码器 ONNX 导出 + Pulsar2 编译 + 校准
-  repack/          Breeze → Qwen3-TTS 结构重打包（权重映射 + 数值对拍）
-  build/           talker / code-predictor 的 pulsar2 llm_build 脚本
-scripts/board/     板端运行时（Python + pyaxengine）
-docs/              架构、转换、部署、性能、经验文档
-reports/           实测报告与日志摘要
-models/            模型包目录结构说明（权重本身在 HF 上）
-```
+非实时（RTF≈11–14×），适合离线合成 / demo；瓶颈是 depth decoder 的 180 次 layer forward 与 talker 每帧权重流。
+demo wav 在 HF 包 `demos/`（4 条 fast + 1 条 quality 对照）。
 
-## 3. 快速开始
-
-> 模型文件较大（约 2.5–3 GB），存放在 HuggingFace：**[yunyu1258/breeze-tts-2-ax650](https://huggingface.co/yunyu1258/breeze-tts-2-ax650)**（待上传）。
+## 3. 上手
 
 ```bash
 # 1) 下载模型包
 export HF_ENDPOINT=https://hf-mirror.com
-hf download yunyu1258/breeze-tts-2-ax650 --local-dir ./models/breeze-tts-2-ax650
+hf download yunyu1258/breeze-tts-2-ax650 --local-dir ./breeze-tts-2-ax650
 
-# 2) 板端跑（AX650，需先装 pyaxengine）
-cd models/breeze-tts-2-ax650
+# 2) 板端（AX650，装 pyaxengine + ml-dtypes + tokenizers）
+cd breeze-tts-2-ax650
+export LD_LIBRARY_PATH=/soc/lib
 python3 runtime/run_breeze_tts.py \
-  --text "欢迎来到今晚的故事时间，让我们一起开始吧。" \
-  --instruction "一位温柔自信的年轻女性，声音清晰，语气亲切。" \
-  --out output.wav
+  --text "今天天气不错，我们一起出去走走吧。你觉得去哪里比较好呢？" \
+  --instruction "用温柔亲切的女声，语速稍慢。" \
+  --out out.wav --dump-tokens tokens.npz
 ```
 
-## 4. 实测（AX650 真板，待补）
+## 4. 目录
 
-| 项 | 结果 |
-|---|---|
-| talker 单帧 decode | 待填 |
-| depth decoder 一帧 15 步 | 待填 |
-| speech tokenizer 解码 | 待填 |
-| 整句 RTF / 首帧延迟 | 待填 |
-| 峰值 CMM / 系统内存 | 待填 |
-| 音质对拍（vs PyTorch 参考） | 待填 |
+```
+scripts/convert/   重打包 (repack_breeze.py) + 文本编码器导出 + pulsar2 编译脚本
+scripts/board/     板端 runtime + 对拍/校验工具
+docs/              架构 / 转换 / 板端部署 / 经验 / 参考生成规格 (ref/)
+reports/           conversion.md / board.md（实测数字）
+models/            模型包结构说明 + configuration.json
+```
 
-## 5. 文档
+## 5. 已知限制
 
-- [docs/architecture.md](docs/architecture.md)：Breeze TTS 2 架构与 AX650 映射（各张量形状/接口）
-- [docs/conversion.md](docs/conversion.md)：转换流水线（重打包、pulsar2、复用 codec）
-- [docs/board-deploy.md](docs/board-deploy.md)：板端环境、部署、运行
-- [docs/performance.md](docs/performance.md)：性能与精度对拍
-- [docs/experience.md](docs/experience.md)：踩坑与经验（llm_build model_type 适配、rope scaling、weight-only 量化等）
-
-## 6. 已知限制
-
-- 第一版只支持 **Voice Design**（无参考音频）；Voice Clone / Voice Direction 需要 codec encoder + speaker encoder，暂未上板。
-- 默认 `cfg_scale=1.0`（无 CFG）。CFG=4 需要双分支前向（2× 计算量），后续可加。
-- **非商业**：见上方许可证说明。
+1. **文本编码器 NPU 版本未交付**：INT8 cos 0.45（动态范围崩坏）、显式 U16 cos 0.90、
+   auto 混合精度的 precision 表全 1.0 但 NPU backend 在 FP32 AxRoPE 上崩（Pulsar2 8.0 工具链 bug）。
+   最终 demo 用 PyTorch/参考实现预算的 text embedding 注入（其余全部 NPU）；转换流水线与 ONNX（cos 1.0）已就绪，
+   等工具链修复即可替换。smooth-quant 尝试结果见 [reports/board.md](reports/board.md) §5。
+2. depth decoder INT8 的量化噪声会让 greedy free-run 从第 3 步起分叉（音频仍可懂，采样模式 ASR 通过）；
+   `quality` 模式（fp16 权重版 depth，约 0.7 GB）可提升保真度，代价 ~2× 延迟。
+3. Voice Clone / Voice Direction（需要 codec encoder + speaker encoder）未上板；CFG 未实现（默认 cfg_scale=1.0）。
+4. **非商业**：见上方许可证说明。

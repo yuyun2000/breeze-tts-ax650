@@ -131,7 +131,11 @@ pulsar2 llm_build --model_type qwen3 \
   --ret_postnorm --chip AX650 --parallel 10
 ```
 
-- 产物：`qwen3_p128_l{0..27}_together.axmodel` ×28 + `qwen3_post.axmodel`。
+- 产物：`qwen3_p128_l{0..27}_together.axmodel` ×28（每个 58,146,324~58,155,764 B），
+  `qwen3_post.axmodel` 4,640,508 B；整目录 **1,632,945,708 B（1.63 GB）**，29 个 axmodel。
+- 实测耗时：**约 24 分钟**（2026-11-11 10:28:03 → 10:52 UTC，`--parallel 10`，10 层/波 ×3 波；
+  每层同时编 1+4 个 prefill shape group 与 kv512，单层约 10-12 分钟）。
+  也做过更快档的 tiny 验证：1 层、kv128、单 group 仅 2.5 分钟。
 - `--ret_postnorm` → post 同时输出 logits `[1,1,2052]`（codebook0 + EOS）与 `output_norm [1,1,2048]`
   （供 code predictor 当 first hidden，等于 Breeze `backbone_last_hidden_state`）。
 - 单层体积/总耗时见 §5（build.log 记录）。
@@ -174,12 +178,19 @@ pulsar2 build --config lm_head_$i.json   # ONNX: code_predictor_lm_head_$i.onnx
 
 | 产物 | 数量 | 单个体积 | 合计 |
 |---|---|---|---|
-| talker 逐层 axmodel | 28 | 见 builds/talker（build 完成时补记）| — |
-| talker post | 1 | — | — |
+| talker 逐层 axmodel | 28 | 58,146,324~58,155,764 B | 1,628.3 MB |
+| talker post | 1 | 4,640,508 B | 4.6 MB |
 | depth 逐层 axmodel | 12 | 30,674,769 B | 368.1 MB |
 | depth post | 1 | 74,483 B | 73 KB |
-| lm_head axmodel | 15 | ~2.2 MB | ~33 MB |
-| embeds bins | 3 | — | ~198 MB |
+| lm_head axmodel | 15 | 2,206,272 B（lmhead_build_* 中间目录另有副本）| 33.1 MB |
+| embeds bins | 3 | 134,414,336 + 67,108,864 + 4,194,304 B | 205.7 MB |
+| depth hp 逐层（quality）| 12 | 111,364,429 B | 1,272.9 MB |
+| depth hp post | 1 | 162,903 B | 159 KB |
+| lm_head hp（U16，quality）| 15 | 2,277,393 B | 32.6 MB |
+| **fast 档合计（axmodel + bin）** | 60 | — | **2,275,087,977 B ≈ 2.28 GB** |
+| **quality 档合计** | 28 | — | **1,306 MB ≈ 1.3 GB**（depth hp 1.3GB + lm_head hp 33MB） |
+
+sha256 清单：`~/work/breeze-tts/repack/ARTIFACT_SHA256.txt`（60 行，覆盖 29 talker + 28 codepred + 3 bin）。
 
 - 编译耗时：depth 12 层 + post 用 `--parallel 6` 约 **5 分钟**（10:28→10:33 UTC）。
   talker 单层在 kv 512 + 5 个 prefill shape group 下约 10-15 分钟，28 层 `--parallel 10` 约 35-45 分钟。
@@ -211,10 +222,73 @@ artifact 保真度（bf16 bin vs f32 参考）：`audio_embed`、`depth_proj`、
 逐元素 max_abs = 0（bf16 原值原样）；`proj_audio_embed` max_abs = 3.9e-3、mean 5.6e-5
 （f32 投影后舍入 bf16，符合预期）。
 
-端到端 greedy token 对拍（12 帧 ×16 codebook，两条完整 pipeline：原始 Breeze 模块 vs
-重打包模型 + 上述 artifacts）：**见 `verify.log`（token 一致率）**。
-> 说明：greedy 对拍里按 `generation_breeze.py` 的规则把保留 id {2048,2049,2050} 的 logits 置 -inf，
-> backbone EOS=2051 出现即停止。
+### 6.1 与 ref-2038 golden 的真实 prompt 对拍（teacher-forced）
+
+`ref/golden_zh_short_greedy`（Voice Design，34-token prompt，64 帧贪心，原始 Breeze 全模型在 bf16
+生成）提供了 `text_embeds[34,2048]`、`tokens[64,16]`、`probe.npz`（每帧 backbone 原始 top-5 logits、
+post-norm hidden、depth 15 步 top-1）。
+
+`teacher_eval.py` 用 **golden 历史 teacher forcing**（每帧喂 golden 的 prompt+历史帧 embedding，
+不做自由回灌），所以误差不会累积：
+
+| 指标（float32 跑 bf16 golden）| 结果 |
+|---|---|
+| talker cb0 贪心选择一致率（64 帧，含 1.1 重复惩罚）| **62/64 = 96.88%** |
+| talker post-norm hidden cos vs golden（前 20 帧）| mean **0.999957** / min 0.999925 |
+| talker 原始 top-5 logits 重合 ≥4/5 | **20/20 = 100%**，top-5 logit MAE 3.2e-2 |
+| depth 15 步 teacher-forced 一致率（20 帧 ×15）| **291/300 = 97.00%** |
+| depth 整帧 15 步全对 | **15/20 = 75%** |
+
+结论：残余 3% 级别的 argmax 不一致来自 **bf16（golden）vs float32（本次对拍）的舍入差**——
+hidden cos 0.99996、top-5 logits 全部命中，说明权重/结构/rope 完全一致，只是少数近 tie 的 argmax 翻转。
+bf16（与 golden 同 dtype）teacher-forced 复跑结果：
+talker cb0 **63/64 = 98.44%**、hidden cos mean 0.999955、top5 100%；depth 15 步 **290/300 = 96.67%**、
+整帧全对 **16/20 = 80%**（见 `teacher_bf16.log`）。残余 1-2% 来自 golden 用 KV-cache 逐 token 前向、
+本对拍用整段前向的 bf16 累加顺序差异，同样只影响近 tie 的 argmax。
+
+自由回灌（free-running）greedy 对拍（`golden_eval.py`，同样 34-token prompt、64 帧）：
+bf16 跑时 frame0 全 16 codebook 命中、cb0 前 5 帧一致，之后因上述 tie 翻转逐步分叉
+（`exact_frame_rate` 低是**误差回灌放大**的结果，不是 repack 误差）。板端实际用温度 0.9 采样，
+不做逐 token 复现，golden 对拍以 teacher-forced 指标为准。
+
+### 6.2 高精度（quality）档重编（板端实测 INT8 后追加）
+
+板端实测发现：INT8 编译的 depth 层与 lm_head 在 near-tie 时 argmax 会翻（lm_head INT8 输出 2051 个
+logits 只有 ~150 个不同值 = 输出被 int8 clamp），因此追加两档高精度产物。**fast 档（INT8）保留不动**。
+
+| 档位 | 产物目录 | 内容 | 体积 |
+|---|---|---|---|
+| fast（INT8，默认）| `builds/talker/`、`builds/code-predictor/` | talker 28 层 INT8 + post；depth 12 层 INT8 + post；lm_head INT8 | 1.63 GB + 401 MB |
+| quality（depth hp）| `builds/code-predictor-hp/` | depth 12 层 + post，`-w bf16 --post_weight_type bf16`（auto 提升到 FP32-heavy 计算）| 1.3 GB（111 MB/层） |
+| quality（lm_head hp）| `builds/lm_head_hp/` | 15 个位置相关 head，**U16 激活/算子精度**（`layer_configs data_type=U16`）+ **真实 per-head 校准**（golden teacher-forced 的 CP post-norm hidden，frames 0-14）| 15 × ~2.2 MB ≈ 33 MB |
+
+- depth hp：`pulsar2 llm_build --model_type llama ... -w bf16 --post_weight_type bf16`，build+check SUCCESS，
+  单层 111,364,429 B（INT8 版 30,674,769 B）、post 162,903 B（INT8 版 74,483 B）。
+- lm_head hp：config 形如
+  ```json
+  {"quant": {"input_configs": [{"tensor_name": "input", "calibration_dataset": "<head_XX.tar>",
+                                 "calibration_size": -1, "calibration_format": "Numpy"}],
+              "layer_configs": [{"start_tensor_names": ["DEFAULT"], "end_tensor_names": ["DEFAULT"],
+                                 "data_type": "U16"}],
+              "calibration_method": "MinMax"},
+   "compiler": {"check": 2, "max_dynamic_batch_size": 1}}
+  ```
+  与 AXERA 官方 `collect_lm_head_calib_hooks.py` 生成格式一致；校准数据必须用**真实** CP post-norm hidden，
+  用随机高斯校准会把输入范围压偏、真实 hidden 越界后被 clamp（曾出现 cos≈0.98、top1 错）。
+- 本地验证方法（20.38，无需开发板）：`pulsar2 run --model <CompiledAxmodel> --input_dir in --output_dir out`，
+  `in/input.bin` 为 float32 原始字节；对 golden 帧的 CP post-norm hidden 跑 head，再与 numpy fp32 matmul 对比。
+  pulsar2 自己的量化 debug（`<out>/quant/debug/io/{float,quant}/output.npy`）可先看该模型量化损失
+  （U16 版：cos 0.99998、2051→1948 unique 值）。
+- **lm_head hp 实测（held-out golden frame 15，15 个 head，与 CPU fp32 matmul 对比）**：
+  cos = **0.999963~0.999994**（全部 ≥0.9999）、**top1 一致 15/15 = 100%**、
+  unique 值 **1769~1917**（INT8 旧版约 150，即板端 clamp 问题已解决）。
+  同时跑旧 INT8 版对照：cos **0.9453~0.9767**、top1 **1/15**、unique **145~247** —— 与板端上报的
+  "2051 个 logits 只有 ~150 个不同值、argmax 错" 完全一致，确认 U16+真实校准是正确修法
+  （对比日志：`/tmp/verify_lean.log`、`/tmp/verify_lmhead_lean.json`）。
+- **depth fp16 尝试（无收益，已放弃）**：`-w fp16 --post_weight_type bf16` 产出的每层 axmodel 与
+  `-w bf16` 版本**逐字节同尺寸（111,364,429 B）**，说明 llm_build 对层权重自动提升为 FP32-heavy 计算，
+  fp16 不会更小。因此 quality 档只有 `builds/code-predictor-hp`（1.3GB）一档；`builds/code-predictor-hp16`
+  是废弃实验目录，可删。
 
 ---
 
@@ -248,7 +322,14 @@ artifact 保真度（bf16 bin vs f32 参考）：`audio_embed`、`depth_proj`、
 | 文件 | 说明 |
 |---|---|
 | `repack_breeze.py` | Breeze → Qwen3/Llama HF 目录 + embeds bin + 15 lm_head ONNX。`--layers N` 可做 tiny build。 |
-| `verify_cpu.py` | 原始 Breeze 模块 vs 重打包 HF 模型的 CPU 数值对拍（含端到端 greedy token 对拍）。 |
+| `verify_cpu.py` | 原始 Breeze 模块 vs 重打包 HF 模型的 CPU 数值对拍（逐层 hidden/logits）。 |
+| `golden_eval.py` | 真实 prompt 自由回灌 greedy 对拍 vs ref-2038 golden。 |
+| `teacher_eval.py` | 真实 prompt teacher-forced 对拍（talker cb0/top5/hidden + depth 15 步）。 |
+| `build_lm_head.sh` / `build_lm_head_hp.sh` | INT8 / U16+真实校准 两版 lm_head 批量编译脚本。 |
+| `make_lmhead_verify_inputs.py` | 生成 lm_head 验证输入（golden teacher-forced CP hidden）+ CPU fp32 参考 + per-head 校准 tar。 |
+| `teacher_eval.py` / `golden_eval.py` | golden teacher-forced / 自由回灌对拍。 |
+| `build_lm_head_hp.sh` | lm_head U16 + 真实 per-head 校准批量编译（quality 档）。 |
+| `ARTIFACT_SHA256.txt` | 交付产物 sha256（fast 档 60 行 + hp 档 28 行 = 88 行）；`builds/lm_head_hp/SHA256SUMS` 额外 15 行。 |
 | `make_lmhead_calib.py` | 生成 lm_head INT8 校准包 `calib/input.tar.gz`。 |
 | `build_lm_head.sh` | 15 个 lm_head ONNX → axmodel 的批量编译脚本。 |
 | `REPACK_REPORT.md` | 本文件。 |
@@ -256,7 +337,34 @@ artifact 保真度（bf16 bin vs f32 参考）：`audio_embed`、`depth_proj`、
 （配套：lead 的同源脚本 `~/work/breeze-tts/repack-lead/repack_breeze.py`、`verify_repack.py`；
 正式 build 使用 `repack-lead/output/{qwen3-talker,llama-depth}` 目录。）
 
-## 9. 遗留 / 待办
+## 9. 20.38 清理清单（收盘时用，2026-11-11 19:25 统计，/ 剩余 29G/249G）
+
+**保留交付（勿删）**：
+| 路径 | 体积 | 说明 |
+|---|---|---|
+| `~/work/breeze-tts/builds/talker/` | 1.53 GB | fast talker 28 层 + post + TALKER_OK |
+| `~/work/breeze-tts/builds/code-predictor/` **顶层 28 个 axmodel** | 401 MB | fast depth 13 + lm_head INT8 15 + CODEPRED_OK |
+| `~/work/breeze-tts/builds/code-predictor-hp/` | 1.3 GB | quality depth 13 + DEPTH_HP_OK |
+| `~/work/breeze-tts/builds/lm_head_hp/` **顶层 15 个 axmodel** | 33 MB | quality lm_head U16 + LMHEAD_OK |
+| `~/work/breeze-tts/embeds/` | 206 MB | 3 个 runtime bin |
+| `~/work/breeze-tts/repack/`（scripts/report/sha256/calib/configs）| ~10 MB | 交付脚本、报告、sha256、校准、复现 config |
+
+**可删（本任务中间产物，约 5.0 GB）**：
+| 路径 | 体积 |
+|---|---|
+| `~/work/breeze-tts/repack/breeze-tts-talker/` + `breeze-tts-code-predictor/` + `repack/embeds/`（我上传的 Mac 重打包副本；正式源是 `repack-lead/output/`）| ~3.5 GB |
+| `~/work/breeze-tts/builds/code-predictor-hp16/`（fp16 废弃实验）| 445 MB |
+| `~/work/breeze-tts/builds/control-0.6b/`（Qwen3-TTS 0.6B control，废弃路线）| 348 MB |
+| `~/work/breeze-tts/builds/code-predictor/lmhead_build_*/`（INT8 编译中间副本，成品在顶层）| 195 MB |
+| `~/work/breeze-tts/builds/code-predictor/lmhead_u16_*/`（第一次 U16 试错，已被 lm_head_hp 取代）| 195 MB |
+| `~/work/breeze-tts/builds/lm_head_hp/lmhead_build_*/`（hp 编译中间副本）| 195 MB |
+| `~/work/breeze-tts/builds/tiny-qwen3/` + `tiny-llama/`（board probe 完可删）| 61 MB |
+| `~/work/breeze-tts/builds/lm_head_test/` | 7 KB |
+| `~/work/breeze-tts/repack/out/`（Mac 侧副本，已不在此机；清理 Mac 时注意）| (3.5 GB Mac) |
+
+> data/(13G)、textenc/(12G)、package_release/(3.2G)、repack-lead/(3.6G) 属其他成员，清理需 lead 协调。
+
+## 10. 遗留 / 待办
 
 - [x] talker 正式 build（28 层 + post）→ `builds/talker/TALKER_OK`
 - [x] depth 正式 build（12 层 + post）→ `builds/code-predictor/CODEPRED_OK`

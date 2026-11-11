@@ -509,7 +509,8 @@ class TalkerRunner:
 class CodePredictorRunner:
     """Breeze depth decoder / Qwen3-TTS code_predictor: per-layer axmodels + post + 15 lm_heads."""
 
-    def __init__(self, cp_dir: str, verbose: bool = False, lm_head_bin: Optional[str] = None):
+    def __init__(self, cp_dir: str, verbose: bool = False, lm_head_bin: Optional[str] = None,
+                 head_dir: Optional[str] = None):
         layer_map = discover_layers(cp_dir, ["qwen3_tts_talker_code_predictor_", "llama_"], "_together.axmodel")
         if not layer_map:
             raise FileNotFoundError("no code-predictor layer axmodels in %s" % cp_dir)
@@ -520,14 +521,15 @@ class CodePredictorRunner:
         if not post_candidates:
             raise FileNotFoundError("code-predictor post not found in %s" % cp_dir)
         head_paths = {}
-        for p in glob.glob(os.path.join(cp_dir, "*.axmodel")):
+        head_search_dirs = [d for d in (head_dir, cp_dir) if d and os.path.isdir(d)]
+        for p in [x for d in head_search_dirs for x in glob.glob(os.path.join(d, "*.axmodel"))]:
             base = os.path.basename(p)
             if "post" in base or "_together" in base:
                 continue
             m = re.search(r"lm_?head_(\d+)\.axmodel$", base) or re.search(r"lm_head_(\d+)\.axmodel$", base)
             if m:
                 head_paths[int(m.group(1))] = p
-        if not head_paths:
+        if not head_paths and not (lm_head_bin and os.path.exists(lm_head_bin)):
             raise FileNotFoundError("no lm_head_{i}.axmodel / code_predictor_lm_head_{i}.axmodel in %s" % cp_dir)
         self.n_heads = len(head_paths) if head_paths else 15
         self.cpu_heads = None
@@ -540,8 +542,20 @@ class CodePredictorRunner:
             # Needed when the compiled lm_head axmodels quantize/saturate their output
             # (observed: ~150 distinct logit values, argmax flips vs golden).
             raw = np.memmap(lm_head_bin, dtype=np.uint16, mode="r")
-            self.cpu_heads = raw
+            n = raw.size
+            if n == 15 * 1024 * 2051:
+                shape = (15, 1024, 2051)
+            elif n == 15 * 2051 * 1024:
+                shape = (15, 2051, 1024)
+            else:
+                raise ValueError("unexpected codebooks_head bin size %d" % n)
+            tc = time.time()
+            u32 = np.ascontiguousarray(raw, dtype=np.uint16).astype(np.uint32) << 16
+            self.cpu_heads = u32.view(np.float32).reshape(shape)
             self.cpu_head_path = lm_head_bin
+            self.cpu_head_mb = self.cpu_heads.nbytes / 1e6
+            print("  [cp] CPU lm_heads preloaded %s %.1f MB in %.1fs"
+                  % (shape, self.cpu_head_mb, time.time() - tc))
             self.n_heads = 15
         else:
             self.heads = [InferenceSession(head_paths[k]) for k in sorted(head_paths)]
@@ -562,18 +576,9 @@ class CodePredictorRunner:
         post_out_names = [n.name for n in self.post.get_outputs(0)]
         self.post_has_norm = any("norm" in n for n in post_out_names)
         if self.cpu_heads is not None:
-            n = self.cpu_heads.size
             self.head_in_dtype = np.float32
             self.head_in_len = 1024
             self.head_vocab = 2051
-            if n == 15 * 1024 * 2051:
-                self.cpu_head_shape = (15, 1024, 2051)
-            elif n == 15 * 2051 * 1024:
-                self.cpu_head_shape = (15, 2051, 1024)
-            else:
-                raise ValueError("unexpected codebooks_head bin size %d (want 15*1024*2051 bf16)" % n)
-            print("  [cp] using CPU lm_heads from %s shape=%s"
-                  % (os.path.basename(lm_head_bin), self.cpu_head_shape))
         else:
             head_in = self.heads[0].get_inputs(0)[0]
             head_out = self.heads[0].get_outputs(0)[0]
@@ -642,14 +647,9 @@ class CodePredictorRunner:
 
     def _head_logits(self, step: int, hnorm: np.ndarray) -> np.ndarray:
         if self.cpu_heads is not None:
-            H, rows, cols = self.cpu_head_shape
-            blk = np.asarray(self.cpu_heads[step * rows * cols:(step + 1) * rows * cols], dtype=np.uint16)
-            u32 = np.ascontiguousarray(blk).astype(np.uint32) << 16
-            w = u32.view(np.float32).reshape(rows, cols)
-            x = np.asarray(hnorm, dtype=np.float32).reshape(-1)[:rows]
-            if rows == 1024 and cols == 2051:
-                return x @ w
-            return (x @ w).reshape(-1)[: self.head_vocab]
+            w = self.cpu_heads[step]
+            x = np.asarray(hnorm, dtype=np.float32).reshape(-1)
+            return x @ w
         ins = self.heads[step].get_inputs(0)[0]
         x = np.zeros(tuple(ins.shape), dtype=ins.dtype)
         n = min(x.shape[-1], hnorm.shape[0])
@@ -659,7 +659,8 @@ class CodePredictorRunner:
 
     def generate(self, hidden_norm: np.ndarray, cb0: int, emb_tables: "MultiEmbed",
                  suppress: np.ndarray, cfg: SampleCfg, rng: np.random.Generator,
-                 proj: Optional[Linear] = None, debug: Optional[Dict[str, np.ndarray]] = None) -> List[int]:
+                 proj: Optional[Linear] = None, debug: Optional[Dict[str, np.ndarray]] = None,
+                 force_codes: Optional[List[int]] = None) -> List[int]:
         """hidden_norm: talker post-norm hidden [H_talker]. Returns cb1..cb15 codes."""
         pos0 = proj(hidden_norm) if proj is not None else hidden_norm
         pos1 = emb_tables.row(0, cb0)
@@ -677,7 +678,8 @@ class CodePredictorRunner:
             code = depth_sample(logits, suppress, cfg, rng)
             out.append(int(code))
             if step < self.n_heads - 1:
-                emb = emb_tables.row(step + 1, code)
+                feed_code = int(force_codes[step]) if force_codes is not None else int(code)
+                emb = emb_tables.row(step + 1, feed_code)
                 h = self._decode(emb, kcs, vcs, cur)
                 cur += 1
         return out
@@ -955,6 +957,8 @@ class Preset:
     name: str
     talker_dir: str
     cp_dir: str
+    cp_hp_dir: str
+    lmhead_hp_dir: str
     codec_dir: str
     talker_hidden: int
     n_codebooks: int = 16
@@ -974,6 +978,7 @@ class Preset:
     textenc_embed_vocab: int = 262158
     textenc_embed_dim: int = 1152
     tokenizer_json: Optional[str] = None
+    embeds_dir: str = ""
     cp_vocab: int = 2051
     cp_suppress: List[int] = field(default_factory=lambda: [2048, 2049, 2050])
 
@@ -988,6 +993,8 @@ def preset_qwen3tts06() -> Preset:
         name="qwen3tts06",
         talker_dir=talker_dir,
         cp_dir=cp_dir,
+        cp_hp_dir="",
+        lmhead_hp_dir="",
         codec_dir=os.path.join(root, "speech_tokenizer"),
         talker_hidden=1024,
         talker_vocab=3072,
@@ -1002,9 +1009,33 @@ def preset_qwen3tts06() -> Preset:
     )
 
 
+def _first_existing(*paths: str) -> str:
+    for p in paths:
+        if p and os.path.exists(p):
+            return p
+    return paths[0] if paths else ""
+
+
+def looks_like_breeze_package(base: str) -> bool:
+    """HF package layout (<base>/talker, <base>/code-predictor, <base>/embeds) or board layout (<base>/builds/...)."""
+    if not base:
+        return False
+    for rel in ("talker", "code-predictor", "embeds",
+                "builds/talker", "builds/code-predictor"):
+        if os.path.isdir(os.path.join(base, rel)):
+            return True
+    return False
+
+
 def preset_breeze(base: str = "/root/breeze-tts/breeze") -> Preset:
-    talker_dir = os.path.join(base, "builds/talker")
-    cp_dir = os.path.join(base, "builds/code-predictor")
+    # support both layouts: HF package (<base>/talker, <base>/code-predictor, ...) and
+    # board workspace (<base>/builds/talker, ...)
+    talker_dir = _first_existing(os.path.join(base, "builds/talker"), os.path.join(base, "talker"))
+    cp_dir = _first_existing(os.path.join(base, "builds/code-predictor"), os.path.join(base, "code-predictor"))
+    cp_hp_dir = _first_existing(os.path.join(base, "builds/code-predictor-hp"),
+                                os.path.join(base, "code-predictor-hp"))
+    lmhead_hp_dir = _first_existing(os.path.join(base, "lm-head-hp"),
+                                    os.path.join(base, "builds/lm-head-hp"))
     embeds_dir = os.path.join(base, "embeds")
     # talker audio embedding tables: 16 x 2051 x 2048 bf16 (one flat bin is fine)
     talker_embed = find_embed_file(embeds_dir, [
@@ -1028,11 +1059,27 @@ def preset_breeze(base: str = "/root/breeze-tts/breeze") -> Preset:
         "inputs_embeds_projector_1024x2048*.bin", "depth_proj_2048x1024*.bin",
         "depth_proj_1024x2048*.bin"], 1024 * 2048 * 2) or \
         os.path.join(embeds_dir, "inputs_embeds_projector_1024x2048.bf16.bin")
+    # speech tokenizer: HF package (<base>/speech-tokenizer) or the old AXERA package path
+    codec_dir = _first_existing(os.path.join(base, "speech-tokenizer"),
+                                "/root/breeze-tts/qwen3tts-ref/speech_tokenizer")
+    # text encoder: HF package (<base>/text-encoder) or board workspace (<base>/textenc)
+    textenc_dir = _first_existing(os.path.join(base, "text-encoder"),
+                                  os.path.join(base, "textenc"))
+    textenc_embed_bin = _first_existing(
+        os.path.join(textenc_dir, "text_embed_262158x1152.bfloat16.bin"),
+        os.path.join(base, "textenc/text_embed_262158x1152.bfloat16.bin"))
+    tokenizer_json = _first_existing(
+        os.path.join(textenc_dir, "tokenizer/tokenizer.json"),
+        os.path.join(base, "tokenizer/tokenizer.json"),
+        os.path.join(base, "text-encoder/tokenizer/tokenizer.json"))
     return Preset(
         name="breeze",
         talker_dir=talker_dir,
         cp_dir=cp_dir,
-        codec_dir="/root/breeze-tts/qwen3tts-ref/speech_tokenizer",
+        cp_hp_dir=cp_hp_dir,
+        lmhead_hp_dir=lmhead_hp_dir,
+        codec_dir=codec_dir,
+        embeds_dir=embeds_dir,
         talker_hidden=2048,
         talker_vocab=2052,
         audio_vocab=2051,
@@ -1044,9 +1091,9 @@ def preset_breeze(base: str = "/root/breeze-tts/breeze") -> Preset:
         depth_embed_groups=depth_embed_groups,
         depth_proj_path=proj,
         depth_proj_shape=(1024, 2048),
-        textenc_dir=os.path.join(base, "textenc"),
-        textenc_embed_bin=os.path.join(base, "textenc/text_embed_262158x1152.bfloat16.bin"),
-        tokenizer_json=os.path.join(base, "tokenizer/tokenizer.json"),
+        textenc_dir=textenc_dir,
+        textenc_embed_bin=textenc_embed_bin,
+        tokenizer_json=tokenizer_json,
     )
 
 
@@ -1092,13 +1139,49 @@ def save_wav(path: str, wav: np.ndarray, sr: int = SAMPLE_RATE) -> None:
 
 # --------------------------------------------------------------------------------------- main loop
 def synthesize(args) -> dict:
-    preset = preset_qwen3tts06() if args.preset == "qwen3tts06" else preset_breeze(args.breeze_base)
+    if args.preset == "qwen3tts06":
+        preset = preset_qwen3tts06()
+    else:
+        base = args.breeze_base or ""
+        if not base:
+            base = "." if looks_like_breeze_package(".") else "/root/breeze-tts/breeze"
+        preset = preset_breeze(base)
+        print("breeze base: %s" % os.path.abspath(base))
+        if args.lmhead_hp and preset.lmhead_hp_dir and os.path.isdir(preset.lmhead_hp_dir):
+            print("using U16 lm_heads from %s" % preset.lmhead_hp_dir)
     if args.talker_dir:
         preset.talker_dir = args.talker_dir
     if args.cp_dir:
         preset.cp_dir = args.cp_dir
+    if args.depth_mode == "hp" and preset.cp_hp_dir:
+        preset.cp_dir = preset.cp_hp_dir
+        print("depth mode: quality (hp) -> %s" % preset.cp_hp_dir)
     if args.codec_dir:
         preset.codec_dir = args.codec_dir
+    if args.dry_run:
+        print("=== dry-run preset resolution ===")
+        print("preset              :", preset.name)
+        print("breeze_base         :", getattr(args, "breeze_base", "") or "(auto)")
+        print("talker_dir          :", preset.talker_dir, "exists=", os.path.isdir(preset.talker_dir))
+        print("cp_dir (depth)      :", preset.cp_dir, "exists=", os.path.isdir(preset.cp_dir))
+        print("cp_hp_dir           :", preset.cp_hp_dir, "exists=", os.path.isdir(preset.cp_hp_dir))
+        print("lmhead_hp_dir       :", preset.lmhead_hp_dir, "exists=", os.path.isdir(preset.lmhead_hp_dir))
+        print("codec_dir           :", preset.codec_dir, "exists=", os.path.isdir(preset.codec_dir))
+        print("embeds_dir          :", preset.embeds_dir, "exists=", os.path.isdir(preset.embeds_dir))
+        print("talker embeds       :", preset.talker_embed_paths)
+        print("depth embeds        :", preset.depth_embed_paths, "groups=", preset.depth_embed_groups)
+        print("depth proj          :", preset.depth_proj_path)
+        print("textenc_dir         :", preset.textenc_dir, "exists=", os.path.isdir(preset.textenc_dir))
+        print("textenc embed bin   :", preset.textenc_embed_bin,
+              "exists=", os.path.exists(preset.textenc_embed_bin or ""))
+        print("tokenizer.json      :", preset.tokenizer_json,
+              "exists=", os.path.exists(preset.tokenizer_json or ""))
+        for name in ("talker_embed_paths", "depth_embed_paths"):
+            for p in getattr(preset, name):
+                print("  %s: %s exists=%s size=%s"
+                      % (name, p, os.path.exists(p), os.path.getsize(p) if os.path.exists(p) else -1))
+        return {"ok": True}
+
     greedy = bool(args.greedy)
     cfg = SampleCfg(temperature=args.temperature, top_k=args.top_k, top_p=args.top_p,
                     repetition_penalty=args.repetition_penalty, greedy=greedy)
@@ -1107,6 +1190,115 @@ def synthesize(args) -> dict:
     t_start = time.time()
     print("preset=%s greedy=%s max_frames=%d stats: %s" % (preset.name, greedy, args.max_frames, stats()))
 
+    # ---- codec-only mode: decode given codes (no talker/depth) ----
+    if args.codes:
+        z = np.load(args.codes, allow_pickle=False)
+        codes = None
+        for k in ("codes", "tokens", "frames", "audio_codes"):
+            if k in z.files:
+                codes = np.asarray(z[k])
+                break
+        if codes is None:
+            raise SystemExit("%s has no codes/tokens array (keys=%s)" % (args.codes, list(z.files)))
+        if codes.ndim == 3:
+            codes = codes[0]
+        if codes.ndim == 2 and codes.shape[0] == 16 and codes.shape[1] != 16:
+            codes = codes.T
+        codes = np.asarray(codes, dtype=np.int32)
+        if codes.ndim != 2 or codes.shape[1] != 16:
+            raise SystemExit("codes shape %s != [T,16]" % (codes.shape,))
+        print("codec-only mode: codes %s (from %s)" % (codes.shape, args.codes))
+        t0 = time.time()
+        codec = SpeechTokenizerDecoder(preset.codec_dir, verbose=args.verbose)
+        timings["load_codec_s"] = time.time() - t0
+        t0 = time.time()
+        wav = codec.decode(codes)
+        timings["codec_decode_s"] = time.time() - t0
+        out_wav = args.out_wav or "/root/breeze-tts/out/codec_decoded.wav"
+        save_wav(out_wav, wav)
+        print("codec-only: %d frames -> %d samples (%.2fs) in %.0f ms; RTF %.3f"
+              % (codes.shape[0], wav.size, wav.size / SAMPLE_RATE, timings["codec_decode_s"] * 1000,
+                 timings["codec_decode_s"] / (codes.shape[0] / 12.5)))
+        print("saved wav:", out_wav)
+        if args.dump_tokens:
+            np.savez(args.dump_tokens, codes=codes,
+                     meta=np.asarray(json.dumps({"mode": "codec_only", "codes_file": args.codes,
+                                                 "timings": {k: float(v) for k, v in timings.items()}},
+                                                ensure_ascii=False)))
+        print("wav stats: min=%.3f max=%.3f rms=%.4f" %
+              (float(wav.min()), float(wav.max()), float(np.sqrt((wav.astype(np.float64) ** 2).mean()))))
+        print("final stats:", stats())
+        return timings
+
+    # ---- prompt -> text embeddings FIRST (textenc axmodels can be huge; load, encode, release)
+    tokens = None
+    embeds = None
+    t0 = time.time()
+    if args.random_text_embeds:
+        L = int(args.random_text_embeds)
+        embeds = rng.standard_normal((L, preset.talker_hidden)).astype(np.float32).astype(BF16)
+        timings["textenc_s"] = time.time() - t0
+        print("random text embeds: L=%d H=%d (glue test)" % (L, preset.talker_hidden))
+    elif args.text_embeds:
+        z = np.load(args.text_embeds, allow_pickle=False)
+        arr = None
+        for k in ("text_embeds", "par_text_embeds", "embeddings", "embeds", "text_encoder_out"):
+            if k in z.files:
+                arr = np.asarray(z[k])
+                break
+        if arr is None:
+            raise SystemExit("%s has no text_embeds-like array (keys=%s)" % (args.text_embeds, list(z.files)))
+        if arr.ndim == 3:
+            arr = arr[0]
+        if arr.shape[-1] != preset.talker_hidden:
+            raise SystemExit("text embeds dim %d != talker hidden %d" % (arr.shape[-1], preset.talker_hidden))
+        embeds = arr.astype(np.float32).astype(BF16)
+        if "prompt_ids" in z.files:
+            tokens = np.asarray(z["prompt_ids"]).reshape(-1).astype(np.int64)
+        timings["textenc_s"] = time.time() - t0
+        print("loaded text embeds from %s: %s (skip text encoder axmodel)" %
+              (args.text_embeds, tuple(embeds.shape)))
+    else:
+        if not preset.tokenizer_json:
+            raise SystemExit("preset has no tokenizer; use --random-text-embeds/--text-embeds for glue test")
+        if args.prompt_ids:
+            if os.path.exists(args.prompt_ids):
+                if args.prompt_ids.endswith(".npy"):
+                    tokens = np.load(args.prompt_ids).astype(np.int64).reshape(-1)
+                elif args.prompt_ids.endswith(".npz"):
+                    zz = np.load(args.prompt_ids)
+                    tokens = np.asarray(zz["prompt_ids"], dtype=np.int64).reshape(-1)
+                else:
+                    jd = json.load(open(args.prompt_ids))
+                    if isinstance(jd, dict) and "prompt_ids" in jd:
+                        ids = jd["prompt_ids"]
+                    elif isinstance(jd, dict) and isinstance(jd.get("prompt"), dict) and "ids" in jd["prompt"]:
+                        ids = jd["prompt"]["ids"]
+                    elif isinstance(jd, dict) and "ids" in jd:
+                        ids = jd["ids"]
+                    else:
+                        raise SystemExit("no prompt_ids/prompt.ids/ids in %s" % args.prompt_ids)
+                    tokens = np.asarray(ids, dtype=np.int64).reshape(-1)
+            else:
+                tokens = np.asarray([int(x) for x in args.prompt_ids.replace(" ", "").split(",") if x],
+                                    dtype=np.int64)
+            print("using explicit prompt ids: L=%d" % len(tokens))
+        else:
+            tok = PromptTokenizer(preset.tokenizer_json)
+            tokens = tok.encode(args.text, args.instruction, args.speaker)
+        print("prompt ids (L=%d): %s" % (len(tokens), tokens.tolist()[:40]))
+        print("  before textenc:", stats())
+        te = TextEncoderRunner(preset.textenc_dir, preset.textenc_embed_bin,
+                               preset.textenc_embed_vocab, preset.textenc_embed_dim, verbose=args.verbose)
+        embeds = te.encode(tokens)
+        timings["textenc_s"] = time.time() - t0
+        print("text encoder: L=%d -> %s %.1fms  %s"
+              % (len(tokens), tuple(embeds.shape), timings["textenc_s"] * 1000, stats()))
+        if not args.keep_textenc:
+            del te
+            gc.collect()
+            print("  released text encoder sessions -> %s" % stats())
+
     # ---- load models
     t0 = time.time()
     talker = TalkerRunner(preset.talker_dir, verbose=args.verbose)
@@ -1114,8 +1306,7 @@ def synthesize(args) -> dict:
     t0 = time.time()
     lmhead_bin = None
     if args.lmhead_cpu:
-        cands = [os.path.join(preset.breeze_base_dir, "embeds/codebooks_head_15x1024x2051.bf16.bin")
-                 if hasattr(preset, "breeze_base_dir") else ""]
+        cands = sorted(glob.glob(os.path.join(preset.embeds_dir, "codebooks_head_15x*.bin")))
         cands += sorted(glob.glob("/root/breeze-tts/breeze/embeds/codebooks_head_15x*.bin"))
         cands += sorted(glob.glob("/root/breeze-tts/breeze/embeds/codebooks_head*.bin"))
         for c in cands:
@@ -1124,7 +1315,8 @@ def synthesize(args) -> dict:
                 break
         if not lmhead_bin:
             print("WARNING: --lmhead-cpu but codebooks_head bin not found; using axmodel heads")
-    cp = CodePredictorRunner(preset.cp_dir, verbose=args.verbose, lm_head_bin=lmhead_bin)
+    head_dir = preset.lmhead_hp_dir if (args.lmhead_hp and os.path.isdir(preset.lmhead_hp_dir)) else None
+    cp = CodePredictorRunner(preset.cp_dir, verbose=args.verbose, lm_head_bin=lmhead_bin, head_dir=head_dir)
     timings["load_cp_s"] = time.time() - t0
     t0 = time.time()
     codec = SpeechTokenizerDecoder(preset.codec_dir, verbose=args.verbose)
@@ -1168,68 +1360,6 @@ def synthesize(args) -> dict:
         print("prewarmed embed tables: talker %.0fms depth %.0fms (total %.1fs)" %
               (p_t * 1000, p_d * 1000, timings["prewarm_embeds_s"]))
 
-    # ---- prompt -> text embeddings
-    tokens = None
-    t0 = time.time()
-    if args.random_text_embeds:
-        L = int(args.random_text_embeds)
-        embeds = rng.standard_normal((L, talker.hidden)).astype(np.float32).astype(BF16)
-        timings["textenc_s"] = time.time() - t0
-        print("random text embeds: L=%d H=%d (glue test)" % (L, talker.hidden))
-    elif args.text_embeds:
-        z = np.load(args.text_embeds, allow_pickle=False)
-        arr = None
-        for k in ("text_embeds", "par_text_embeds", "embeddings", "embeds", "text_encoder_out"):
-            if k in z.files:
-                arr = np.asarray(z[k])
-                break
-        if arr is None:
-            raise SystemExit("%s has no text_embeds-like array (keys=%s)" % (args.text_embeds, list(z.files)))
-        if arr.ndim == 3:
-            arr = arr[0]
-        if arr.shape[-1] != talker.hidden:
-            raise SystemExit("text embeds dim %d != talker hidden %d" % (arr.shape[-1], talker.hidden))
-        embeds = arr.astype(np.float32).astype(BF16)
-        timings["textenc_s"] = time.time() - t0
-        if "prompt_ids" in z.files:
-            tokens = np.asarray(z["prompt_ids"]).reshape(-1).astype(np.int64)
-        print("loaded text embeds from %s: %s (skip text encoder axmodel)" %
-              (args.text_embeds, tuple(embeds.shape)))
-    else:
-        if not preset.tokenizer_json:
-            raise SystemExit("preset has no tokenizer; use --random-text-embeds/--text-embeds for glue test")
-        if args.prompt_ids:
-            if os.path.exists(args.prompt_ids):
-                if args.prompt_ids.endswith(".npy"):
-                    tokens = np.load(args.prompt_ids).astype(np.int64).reshape(-1)
-                elif args.prompt_ids.endswith(".npz"):
-                    z = np.load(args.prompt_ids)
-                    tokens = np.asarray(z["prompt_ids"], dtype=np.int64).reshape(-1)
-                else:
-                    jd = json.load(open(args.prompt_ids))
-                    if isinstance(jd, dict) and "prompt_ids" in jd:
-                        ids = jd["prompt_ids"]
-                    elif isinstance(jd, dict) and isinstance(jd.get("prompt"), dict) and "ids" in jd["prompt"]:
-                        ids = jd["prompt"]["ids"]
-                    elif isinstance(jd, dict) and "ids" in jd:
-                        ids = jd["ids"]
-                    else:
-                        raise SystemExit("no prompt_ids/prompt.ids/ids in %s" % args.prompt_ids)
-                    tokens = np.asarray(ids, dtype=np.int64).reshape(-1)
-            else:
-                tokens = np.asarray([int(x) for x in args.prompt_ids.replace(" ", "").split(",") if x],
-                                    dtype=np.int64)
-            print("using explicit prompt ids: L=%d" % len(tokens))
-        else:
-            tok = PromptTokenizer(preset.tokenizer_json)
-            tokens = tok.encode(args.text, args.instruction, args.speaker)
-        print("prompt ids (L=%d): %s" % (len(tokens), tokens.tolist()[:40]))
-        te = TextEncoderRunner(preset.textenc_dir, preset.textenc_embed_bin,
-                               preset.textenc_embed_vocab, preset.textenc_embed_dim, verbose=args.verbose)
-        embeds = te.encode(tokens)
-        timings["textenc_s"] = time.time() - t0
-        print("text encoder: L=%d -> %s %.1fms" % (len(tokens), tuple(embeds.shape), timings["textenc_s"] * 1000))
-    print("after prompt: %s" % stats())
 
     # ---- suppression masks
     if preset.name == "qwen3tts06":
@@ -1405,9 +1535,13 @@ def synthesize(args) -> dict:
 def main():
     ap = argparse.ArgumentParser(description="Breeze TTS 2 board runtime (numpy + pyaxengine)")
     ap.add_argument("--preset", choices=["qwen3tts06", "breeze"], default="breeze")
-    ap.add_argument("--breeze-base", default="/root/breeze-tts/breeze")
+    ap.add_argument("--breeze-base", default="",
+                    help="Breeze package/workspace root (default: '.' if it looks like a package, "
+                         "else /root/breeze-tts/breeze)")
     ap.add_argument("--talker-dir", default="")
-    ap.add_argument("--cp-dir", default="")
+    ap.add_argument("--cp-dir", "--depth-dir", dest="cp_dir", default="",
+                    help="override depth-decoder axmodel dir (fast INT8: builds/code-predictor, "
+                         "quality FP32: builds/code-predictor-hp)")
     ap.add_argument("--codec-dir", default="")
     ap.add_argument("--text", default="今天天气不错，我们出去走走吧。")
     ap.add_argument("--instruction", default="用温柔亲切的女声，语速稍慢。")
@@ -1417,9 +1551,19 @@ def main():
     ap.add_argument("--prompt-ids", default="", help="explicit prompt token ids: comma list, or .npy/.npz/.json file")
     ap.add_argument("--text-embeds", default="",
                     help="npz with precomputed text_embeds [T,2048] (skip text encoder axmodel; fallback path)")
+    ap.add_argument("--codes", default="",
+                    help="codec-only mode: npz/npy with codes [T,16] to decode directly (no talker/depth)")
     ap.add_argument("--no-codec", action="store_true", help="skip codec decode (fast token-only parity runs)")
+    ap.add_argument("--depth-mode", choices=["fast", "hp"], default="fast",
+                    help="fast = INT8 depth (default), hp = high-precision depth dir (code-predictor-hp)")
+    ap.add_argument("--lmhead-hp", action="store_true",
+                    help="use U16 lm_head axmodels from <base>/lm-head-hp if present")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="resolve presets/paths and exit (no model loading)")
     ap.add_argument("--lmhead-cpu", action="store_true",
                     help="compute depth lm_heads on CPU from codebooks_head bin (avoids quantized axmodel heads)")
+    ap.add_argument("--keep-textenc", action="store_true",
+                    help="keep text encoder sessions loaded (default: release before loading talker/cp/codec)")
     ap.add_argument("--no-prewarm", action="store_true",
                     help="skip sequential page-cache warmup of the embedding tables")
     ap.add_argument("--probe-frames", type=int, default=0,
