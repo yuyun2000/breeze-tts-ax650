@@ -344,14 +344,57 @@ def infer_linear_layout(path: str, dim_a: int, dim_b: int) -> str:
     return "out_in"
 
 
-def find_embed_file(embeds_dir: str, patterns: List[str], expect_bytes: int) -> Optional[str]:
+def autodetect_depth_proj(talker_emb: "MultiEmbed", depth_emb: "MultiEmbed", proj_path: str,
+                          in_dim: int, out_dim: int, n_probe: int = 4) -> Optional["Linear"]:
+    """Breeze `inputs_embeds_projector` weight layout differs between exports
+    ([out,in] row-major vs [in,out] row-major). Detect it numerically by checking which candidate
+    reproduces the exported projected embedding table: E' = E @ W.
+
+    Returns a Linear callable (x[in_dim] -> y[out_dim]) or None if detection is not possible.
+    """
+    if not (proj_path and os.path.exists(proj_path)):
+        return None
+    try:
+        c1 = Linear(proj_path, out_dim, in_dim, layout="out_in")    # y = x @ W.T
+        c2 = Linear(proj_path, in_dim, out_dim, layout="in_out")    # y = x @ W
+    except Exception:
+        return None
+    if talker_emb is None or depth_emb is None or len(depth_emb) < 1:
+        return c1
+    step = max(1, talker_emb.rows // (n_probe + 1))
+    cbs = [i * step for i in range(1, n_probe + 1)]
+    A = np.stack([talker_emb.row(0, cb).astype(np.float32) for cb in cbs])   # [N, in]
+    E = np.stack([depth_emb.row(0, cb).astype(np.float32) for cb in cbs])    # [N, out]
+    best = None
+    for name, fn, lin in (("out_in", lambda x: x @ lin_w(c1), c1), ("in_out", lambda x: x @ lin_w(c2), c2)):
+        try:
+            y = np.stack([fn(A[i]) for i in range(len(cbs))])
+        except Exception:
+            continue
+        cosv = float(np.sum(E * y) / (np.linalg.norm(E) * np.linalg.norm(y) + 1e-30))
+        if best is None or cosv > best[1]:
+            best = (lin, cosv, name)
+    if best is None:
+        return c1
+    print("  depth proj layout auto-detect: %s (cos vs exported E' = %.5f)" % (best[2], best[1]))
+    return best[0]
+
+
+def lin_w(lin):
+    """Return effective [in, out] matmul matrix for a Linear."""
+    return lin.w.T if lin.layout == "out_in" else lin.w
+
+
+def find_embed_file(embeds_dir: str, patterns: List[str], expect_bytes: int,
+                    allow_size_fallback: bool = True) -> Optional[str]:
     for pat in patterns:
         for p in sorted(glob.glob(os.path.join(embeds_dir, pat))):
             if os.path.getsize(p) == expect_bytes:
                 return p
-    for p in sorted(glob.glob(os.path.join(embeds_dir, "*.bin"))):
-        if os.path.getsize(p) == expect_bytes:
-            return p
+    if allow_size_fallback:
+        for p in sorted(glob.glob(os.path.join(embeds_dir, "*.bin"))):
+            if os.path.getsize(p) == expect_bytes:
+                return p
     return None
 
 
@@ -1040,16 +1083,21 @@ def preset_breeze(base: str = "/root/breeze-tts/breeze") -> Preset:
     # talker audio embedding tables: 16 x 2051 x 2048 bf16 (one flat bin is fine)
     talker_embed = find_embed_file(embeds_dir, [
         "audio_embed_16x2051x2048*.bin", "audio_embeds_16x2051x2048*.bin",
-        "talker_audio_embeds*.bin"], 16 * 2051 * 2048 * 2) or \
+        "talker_audio_embeds*.bin"], 16 * 2051 * 2048 * 2, allow_size_fallback=False) or \
+        find_embed_file(embeds_dir, ["*.bin"], 16 * 2051 * 2048 * 2) or \
         os.path.join(embeds_dir, "audio_embed_16x2051x2048.bf16.bin")
-    # depth input tables: projected E' (1024-dim), 15 groups (2038) or 16 groups (lead export)
-    depth_embed = find_embed_file(embeds_dir, [
-        "codec_embed_proj_15x2051x1024*.bin", "proj_audio_embed_16x2051x1024*.bin",
-        "audio_embeds_proj_15x2051x1024*.bin"], 15 * 2051 * 1024 * 2)
-    depth_embed_groups = 15
+    # depth input tables: projected E' (1024-dim), 15 groups (repack) or 16 groups (lead export)
+    depth_embed = None
+    depth_embed_groups = 0
+    for pat, ng in (("codec_embed_proj_15x2051x1024*.bin", 15),
+                    ("audio_embeds_proj_15x2051x1024*.bin", 15)):
+        p15 = find_embed_file(embeds_dir, [pat], ng * 2051 * 1024 * 2, allow_size_fallback=False)
+        if p15:
+            depth_embed, depth_embed_groups = p15, ng
+            break
     if depth_embed is None:
         p16 = find_embed_file(embeds_dir, ["proj_audio_embed_16x2051x1024*.bin"],
-                              16 * 2051 * 1024 * 2)
+                              16 * 2051 * 1024 * 2, allow_size_fallback=False)
         if p16:
             depth_embed, depth_embed_groups = p16, 16
     if depth_embed is None:
@@ -1338,14 +1386,11 @@ def synthesize(args) -> dict:
         proj = None
         if preset.depth_proj_path and os.path.exists(preset.depth_proj_path):
             out_d, in_d = preset.depth_proj_shape  # (1024, 2048)
-            layout = "in_out" if "_2048x1024" in os.path.basename(preset.depth_proj_path) or \
-                "_2048x1024." in os.path.basename(preset.depth_proj_path) else "out_in"
-            if layout == "in_out":
-                proj = Linear(preset.depth_proj_path, in_d, out_d, layout="in_out")
-            else:
+            proj = autodetect_depth_proj(talker_emb, depth_emb, preset.depth_proj_path, in_d, out_d)
+            if proj is None:
                 proj = Linear(preset.depth_proj_path, out_d, in_d, layout="out_in")
-            print("depth proj: %s shape(in=%d,out=%d) layout=%s"
-                  % (os.path.basename(preset.depth_proj_path), in_d, out_d, layout))
+            print("depth proj: %s shape(in=%d,out=%d) effective_layout=%s"
+                  % (os.path.basename(preset.depth_proj_path), in_d, out_d, proj.layout))
     else:
         talker_emb = MultiEmbed(preset.talker_embed_paths, preset.talker_vocab, preset.talker_hidden)
         depth_emb = MultiEmbed(preset.depth_embed_paths, preset.codebook_size, preset.talker_hidden)
