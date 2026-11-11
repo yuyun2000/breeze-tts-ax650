@@ -1,0 +1,18 @@
+{
+  "input": "/home/m5stack/work/breeze-tts/repack-lead/output/lm_head_onnx/code_predictor_lm_head_13.onnx",
+  "output_dir": "/home/m5stack/work/breeze-tts/builds/code-predictor/lmhead_build_13",
+  "output_name": "code_predictor_lm_head_13.axmodel",
+  "model_type": "ONNX",
+  "target_hardware": "AX650",
+  "npu_mode": "NPU1",
+  "input_shapes": "input:1x1x1024",
+  "onnx_opt": {"model_check": true},
+  "output_processors": [{"tensor_name": "output", "output_dtype": "FP32", "tensor_layout": "DefaultLayout"}],
+  "quant": {
+    "input_configs": [{"tensor_name": "input", "calibration_dataset": "/home/m5stack/work/breeze-tts/repack/calib/input.tar.gz", "calibration_format": "Numpy", "calibration_size": 64}],
+    "calibration_method": "MinMax",
+    "precision_analysis": false,
+    "highest_mix_precision": false
+  },
+  "compiler": {"check": 2}
+}

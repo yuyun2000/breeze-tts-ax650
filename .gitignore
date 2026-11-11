@@ -1,0 +1,16 @@
+# 大文件/中间产物不进 git
+*.onnx
+*.onnx_data
+*.axmodel
+*.bin
+*.safetensors
+*.npz
+*.wav
+*.pcm
+*.log
+calib*/
+build*/
+output*/
+__pycache__/
+*.pyc
+.env

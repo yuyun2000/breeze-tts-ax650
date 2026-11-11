@@ -1,0 +1,88 @@
+{
+  "model": "breeze-tts-2-ax650",
+  "source_model": "BreezeBlue/Breeze-TTS-2",
+  "target": "AX650",
+  "audio": {
+    "sample_rate": 24000,
+    "frame_rate": 12.5,
+    "samples_per_frame": 1920,
+    "num_codebooks": 16,
+    "codebook_size": 2048,
+    "audio_vocab_size": 2051,
+    "reserved_masked_ids": [2048, 2049, 2050]
+  },
+  "talker": {
+    "hidden_size": 2048,
+    "num_hidden_layers": 28,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 8,
+    "head_dim": 128,
+    "kv_dim": 1024,
+    "intermediate_size": 6144,
+    "rms_norm_eps": 1e-06,
+    "rope_theta": 1000000,
+    "rope_scaling": null,
+    "kv_cache_len": 512,
+    "prefill_len": 128,
+    "prefill_groups": 5,
+    "logits_size": 2052,
+    "backbone_eos_id": 2051,
+    "axmodel_pattern": "qwen3_p128_l{i}_together.axmodel",
+    "post_axmodel": "qwen3_post.axmodel",
+    "audio_embed_table": "embeds/audio_embed_16x2051x2048.bfloat16.bin"
+  },
+  "depth_decoder": {
+    "hidden_size": 1024,
+    "num_hidden_layers": 12,
+    "num_attention_heads": 8,
+    "num_key_value_heads": 2,
+    "head_dim": 128,
+    "kv_dim": 256,
+    "intermediate_size": 8192,
+    "rms_norm_eps": 1e-05,
+    "rope_theta": 500000,
+    "rope_scaling": {"rope_type": "llama3", "factor": 32.0, "original_max_position_embeddings": 16, "high_freq_factor": 0.0078125, "low_freq_factor": 0.001953125},
+    "kv_cache_len": 32,
+    "prefill_len": 16,
+    "num_code_groups": 16,
+    "vocab_size": 2051,
+    "axmodel_pattern": "llama_p16_l{i}_together.axmodel",
+    "post_axmodel": "llama_post.axmodel",
+    "lm_head_pattern": "code_predictor_lm_head_{i}.axmodel",
+    "projected_embed_table": "embeds/proj_audio_embed_16x2051x1024.bfloat16.bin",
+    "depth_proj": "embeds/depth_proj_2048x1024.bfloat16.bin"
+  },
+  "text_encoder": {
+    "hidden_size": 1152,
+    "num_hidden_layers": 26,
+    "vocab_size": 262158,
+    "seq_len": 128,
+    "output_size": 2048,
+    "chunk1_axmodel": "text-encoder/textenc_L128_c1of2.axmodel",
+    "chunk2_axmodel": "text-encoder/textenc_L128_c2of2.axmodel",
+    "embedding_lut": "text-encoder/text_embed_262158x1152.bfloat16.bin",
+    "eoi_embedding": "text-encoder/eoi_embedding.npy",
+    "embedding_scale": 33.941125,
+    "tokenizer_dir": "text-encoder/tokenizer"
+  },
+  "speech_tokenizer": {
+    "decode_pre_axmodel": "speech-tokenizer/speech_tokenizer_decode_pre_inproj.axmodel",
+    "decoder_dir": "speech-tokenizer/decoder",
+    "decode_post_axmodel": "speech-tokenizer/speech_tokenizer_decode_post_t64.axmodel",
+    "codes_bucket": 325,
+    "decode_post_bucket": 64,
+    "decode_post_left_context": 25,
+    "source": "AXERA-TECH/Qwen3-TTS-12Hz-0.6B-Base-AX650 (speech_tokenizer), weights byte-identical to Qwen/Qwen3-TTS-Tokenizer-12Hz / Breeze audio_tokenizer"
+  },
+  "sampling": {
+    "backbone": {"do_sample": true, "temperature": 0.9, "top_k": 50, "top_p": 1.0, "repetition_penalty": 1.1},
+    "depth_decoder": {"do_sample": true, "temperature": 0.9, "top_k": 50, "top_p": 1.0},
+    "max_frames": 120,
+    "cfg_scale": 1.0,
+    "mask_reserved_after_topk": true
+  },
+  "prompt": {
+    "voice_design_template": "[S0]<ins_bos>{instruction}<ins_eos>{text}",
+    "special_token_ids": {"<bos>": 2, "<eos>": 1, "<pad>": 0, "[S0]": 262146, "<ins_bos>": 262156, "<ins_eos>": 262157, "<|AUDIO|>": 262144, "<|audio_eos|>": 262145}
+  }
+}

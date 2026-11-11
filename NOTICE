@@ -1,0 +1,29 @@
+Breeze TTS 2 — AX650 (AXMODEL) — NOTICE
+
+This package contains converted model artifacts (axmodel) derived from:
+
+1) Breeze TTS 2 (https://huggingface.co/BreezeBlue/Breeze-TTS-2)
+   Copyright (c) BreezeBlue / RESONIA, INC.
+   Model weights, derivative models and self-hosted outputs are licensed under the
+   BreezeBlue Research and Non-Commercial License 1.1 (see BREEZEBLUE_LICENSE.txt).
+   **Research and non-commercial use only. Commercial use is NOT granted.**
+   The inference source code of the original model is Apache-2.0.
+
+2) Qwen3-TTS Tokenizer 12Hz (https://huggingface.co/Qwen/Qwen3-TTS-Tokenizer-12Hz)
+   Copyright (c) Alibaba Qwen Team, Apache-2.0.
+   Breeze TTS 2 bundles this tokenizer byte-identically (sha256 836b7b35...571258);
+   the speech-tokenizer/*.axmodel files in this package are AXERA-compiled artifacts
+   of that tokenizer, reused from:
+   - AXERA-TECH/Qwen3-TTS-12Hz-0.6B-Base-AX650 (Hugging Face),
+   - AXERA TECH Qwen3-TTS conversion project https://github.com/AXERA-TECH/Qwen3-TTS.AXERA
+   They are redistributed here for research/non-commercial reproducibility with attribution.
+   If the rights holder requests removal, remove speech-tokenizer/ and re-download it from
+   the AXERA repository above (files are identical).
+
+3) Conversion/runtime code in runtime/ and scripts at https://github.com/yuyun2000/breeze-tts-ax650
+   is licensed Apache-2.0, written for this conversion (uses AXERA Pulsar2/AX Engine toolchain).
+
+4) Conversion toolchain: AXERA Pulsar2 8.0 / AX Engine runtime (proprietary, provided by AXERA).
+   This package does not include the toolchain itself.
+
+No warranty. Provided "AS IS" for research purposes.
