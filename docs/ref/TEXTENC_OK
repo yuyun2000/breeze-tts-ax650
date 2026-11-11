@@ -1,0 +1,12 @@
+TEXTENC_OK 2026-11-11T20:40 CST (owner exp-2038)
+PASS: chain cosine (pulsar2 run simulation vs ONNX fp32) = 0.9996766 (real tokens) / 0.9995082 (all positions), max_abs_diff=0.25
+c1: build/c1of2_hp/textenc_L128_c1of2.axmodel   381,721,897 B  sha256 80bed2d805b600e6d58a6516a7f269f65a4b263a1aba9b42d835e25ae52c2c2f
+c2: build/c2of2_hp/textenc_L128_c2of2.axmodel   384,311,393 B  sha256 57a9db9399e0cece2ad1f4d3d1864860bda7be0e8d6a40713f7fb03fef19233d
+segment cosine: c1 axmodel vs ONNX chunk1 hidden = 0.999846
+precision table: 503 nodes, min node cos 0.99928, final 0.9999x
+config: S8 weights + all-U16 activations; layer_configs op_types = MatMul Add Mul Sub Div Pow ReduceMean Sqrt Tanh Softmax Neg
+        Slice Transpose Reshape Expand Cast Concat Where Equal Unsqueeze Squeeze ConstantOfShape
+        RMSNormalization LayerNormalization FullyConnected Gelu RotaryEmbedding RoPE AxRoPE
+calibration: calib/calib16 (16 real zh/en prompts) for c1; calib/c2_hidden (16 prompts -> ONNX chunk1 hidden) for c2
+target: AX650 / NPU1 / Pulsar2 8.0;  onnx: onnx/textenc_L128_c{1,2}of2.onnx
+protocol: inputs_embeds f32[1,128,1152] + attention_mask f32[1,128] -> chunk1 hidden[1,128,1152] -> chunk2 text_embeds[1,128,2048]

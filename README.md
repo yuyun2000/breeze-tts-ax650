@@ -16,7 +16,7 @@ Artificial Analysis TTS 榜单开源第一）转换并部署到 **AX650/AX8850 N
 
 | 组件 | 原始结构 | AX650 部署方式 | 状态 |
 |---|---|---|---|
-| 文本编码器 | T5Gemma2 encoder（26L, hidden 1152, 双向） | 两段静态 ONNX → `pulsar2 build`；embedding 查表在 CPU（bf16 LUT mmap） | ⚠️ NPU 版本受工具链混合精度 bug 阻塞（见 §5），demo 用 golden text_embeds 注入 |
+| 文本编码器 | T5Gemma2 encoder（26L, hidden 1152, 双向） | 两段静态 ONNX → `pulsar2 build`（U16 激活 + S8 权重，fused-op-aware 精度修复）；embedding 查表在 CPU（bf16 LUT mmap） | ✅ NPU（链式 cos 0.99968） |
 | Backbone（talker） | Qwen3 式 28L，hidden 2048，预测 codebook0 | 重打包成 Qwen3ForCausalLM → `pulsar2 llm_build --model_type qwen3` 逐层 axmodel | ✅ NPU |
 | Depth decoder | Llama 式 12L，hidden 1024，预测 codebook1..15 | 重打包成 LlamaForCausalLM → `--model_type llama` 逐层 axmodel + 15 个 head | ✅ NPU |
 | 音频 codec | Qwen3-TTS Tokenizer 12Hz（Mimi 系），24 kHz | **直接复用 AXERA 已编译 Qwen3-TTS speech_tokenizer axmodel**（与 Breeze codec 权重字节一致） | ✅ NPU |
@@ -30,6 +30,7 @@ qwen3 / θ=1e6 / 普通 RoPE）；只有 depth decoder 真正用 llama3 rope。P
 
 | 项 | 结果 |
 |---|---|
+| 文本编码器（两段串行） | 加载 1.58 s；单次编码（34 token, L=128 桶）**196 ms**；链式 cos **0.99968** vs ONNX fp32；CMM +742 MB（编码后释放） |
 | talker decode | **133–146 ms/帧**（28 层 INT8，kv 512） |
 | depth decoder | **≈500–570 ms/帧**（15 步 × 12 层 INT8 + U16 lm_head 在 NPU；`--lmhead-cpu` 可兜底） |
 | codec decode | 522 ms（5.12 s 音频）/ 1249 ms（6.72 s） |
@@ -67,13 +68,14 @@ reports/           conversion.md / board.md（实测数字）
 models/            模型包结构说明 + configuration.json
 ```
 
-## 5. 已知限制
+## 5. 已知限制 / 经验
 
-1. **文本编码器 NPU 版本未交付**：INT8 cos 0.45（动态范围崩坏）、显式 U16 cos 0.90、
-   auto 混合精度的 precision 表全 1.0 但 NPU backend 在 FP32 AxRoPE 上崩（Pulsar2 8.0 工具链 bug）。
-   最终 demo 用 PyTorch/参考实现预算的 text embedding 注入（其余全部 NPU）；转换流水线与 ONNX（cos 1.0）已就绪，
-   等工具链修复即可替换。smooth-quant 尝试结果见 [reports/board.md](reports/board.md) §5。
+1. **文本编码器混合精度的坑（已解决，值得记录）**：Pulsar2 8.0 里只按 ONNX op 名配 U16 不够——
+   **融合后的节点名（FullyConnected / RMSNormalization / RotaryEmbedding / Gelu 等）也必须一起配 U16**，
+   否则这些节点输出仍是 U8，cos 只有 0.90；INT8 更只有 0.45。auto 混合精度会退化成"未量化"并崩在 FP32 AxRoPE
+   （工具链 bug）。最终方案：S8 权重 + 全 U16 激活 + fused-op-aware layer_configs，链式 cos 0.99968。
+   详见 [docs/experience.md](docs/experience.md) 与 [docs/ref/TEXTENC_REPORT.md](docs/ref/TEXTENC_REPORT.md)。
 2. depth decoder INT8 的量化噪声会让 greedy free-run 从第 3 步起分叉（音频仍可懂，采样模式 ASR 通过）；
-   `quality` 模式（fp16 权重版 depth，约 0.7 GB）可提升保真度，代价 ~2× 延迟。
+   `quality` 模式（FP32-heavy depth 1.3 GB）可提升保真度，代价 ~2.5× 延迟。
 3. Voice Clone / Voice Direction（需要 codec encoder + speaker encoder）未上板；CFG 未实现（默认 cfg_scale=1.0）。
 4. **非商业**：见上方许可证说明。

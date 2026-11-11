@@ -34,7 +34,7 @@ tags:
 | `talker/` | Qwen3 式 28 层（hidden 2048）per-layer axmodel + post（final norm + lm_head 2048→2052） | 1.63 GB |
 | `code-predictor/` | Llama 式 12 层（hidden 1024, kv 256）per-layer axmodel + post(norm) + 15 个位置相关 lmmodel（INT8）；U16 版在 `lm-head-hp/` | 0.40 GB |
 | `embeds/` | 16 组未投影音频 embedding 表（talker 帧求和）+ 15 组投影表（depth 输入）+ depth 投影矩阵 | 0.21 GB |
-| `text-encoder/` | T5Gemma2 文本编码器：CPU embedding LUT（bf16）+ tokenizer；NPU axmodel 见下方"已知限制" | 0.61 GB |
+| `text-encoder/` | T5Gemma2 文本编码器：两段 NPU axmodel（U16 激活 + S8 权重，链式 cos 0.99968）+ CPU embedding LUT（bf16）+ tokenizer | 1.38 GB |
 | `speech-tokenizer/` | Qwen3-TTS Tokenizer 12Hz decoder（decode_pre + 8 层 transformer + decode_post），**复用 AXERA 已编译产物** | 0.16 GB |
 | `runtime/` | 板端 Python runtime（`run_breeze_tts.py`） | <1 MB |
 | `demos/` | 板端合成示例（24 kHz wav） | ~1 MB |
@@ -60,6 +60,7 @@ python3 runtime/run_breeze_tts.py \
 
 | 项 | 结果 |
 |---|---|
+| 文本编码器 | 两段串行：加载 1.58 s、编码 196 ms/次（34 token）、CMM +742 MB 后释放 | 
 | talker decode | 133–146 ms/帧（28 层 INT8，kv 512） |
 | depth decoder（15 步 × 12 层） | 564–758 ms/帧（INT8 fast） / 1433 ms/帧（hp quality） |
 | codec decode | 0.5–1.25 s/句 |
@@ -70,10 +71,10 @@ python3 runtime/run_breeze_tts.py \
 
 ## 已知限制
 
-1. **文本编码器 NPU 版本未包含**：Pulsar2 8.0 工具链在混合精度 FP32 RoPE（AxRoPE）上崩溃；
-   INT8 cos 0.45 / 显式 U16 0.90 均不达标。本包提供 CPU embedding LUT + tokenizer，
-   板端 runtime 支持 `--text-embeds <npz>` 注入参考实现编码的 embedding（demo 即此方式；其余模块全部 NPU）。
-2. depth INT8 量化噪声在 greedy free-run 时会于 near-tie 翻转（音频仍可懂，采样模式 ASR 通过）。
+1. 文本编码器为 **U16 激活 + S8 权重** 混合精度（两段串行，链式 cos 0.99968）；若需要 bit 级一致，
+   可用 `--text-embeds <npz>` 注入参考实现算出的 embedding（`demos/text_embeds/` 有 4 条示例）。
+2. depth INT8 量化噪声在 greedy free-run 时会于 near-tie 翻转（音频仍可懂，采样模式 ASR 通过）；
+   `--depth-mode hp` 可切 quality 模式。
 3. Voice Clone / Voice Direction（codec encoder + speaker encoder）、CFG 未实现。
 
 ## 来源

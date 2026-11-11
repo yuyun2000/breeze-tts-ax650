@@ -135,3 +135,55 @@ python scripts/run_simulate.py --axmodel build/c1of2/textenc_L128_c1of2.axmodel 
 - 已删（本轮清理）：`build/*/work/` 全部中间目录、失败的 `build/{c1of2_auto,c1of2_npuauto,c2of2_auto,c2of2_npuauto,c1of2_sq,c2of2_sq}`、无产物的 `build/{c1of2_u16,c2of2}`、重复的 `env/wheels/torch_cpu.whl`（184MB）→ 释放 **~16 GB**（/ 可用 28G→44G）。
 - 仍可清理（后续确认后）：`build/` 剩余编译日志/配置（<400MB）、`simulate/`（2.3M）、`artifacts/` INT8 axmodel（341M，反例证据，建议留到报告定稿）。
 - **不要删**：`onnx/`、`weights/`、`calib/`、`evidence/`、`verify/`、`scripts/`。
+
+---
+
+# BONUS（2026-11-11 20:40 CST）：fused 节点 U16 修复 → **达标交付**
+
+## 结论
+- **链式 cosine（pulsar2 run 仿真 vs ONNX fp32）= 0.9996766（实 token）/ 0.9995082（全位置）** → ≥0.99，**textenc axmodel 可交付**。
+- 两段 axmodel：c1 **381,721,897 B (381.7MB)** `sha256 80bed2d8…2c2f`；c2 **384,311,393 B (384.3MB)** `sha256 57a9db93…9233d`（比 INT8 的 357.5MB 仅大 ~7%，CMM 友好）。
+- 产物路径：`build/c1of2_hp/textenc_L128_c1of2.axmodel`、`build/c2of2_hp/textenc_L128_c2of2.axmodel`（config 同目录），标记 `build/TEXTENC_OK`。
+
+## 根因（之前 0.90 的原因）
+之前显式 U16 只覆盖了 **ONNX op_type**（MatMul/Add/Mul/…），但 Pulsar2 会先做算子融合，产生 `FullyConnected`(91)、`RMSNormalization`(51)、`RotaryEmbedding`(26)、`Gelu`(13) 等 fused 节点，**这些节点输出仍是 U8**（从 `quant_axmodel.json::tensor_configs` 逐节点 bit_width 可证：196 个节点输出 8-bit）→ RMSNorm/MLP 激活以 U8 进入后续计算，精度卡在 0.90。
+
+## 修复（配置层面，无需改 ONNX）
+在 `quant.layer_configs` 的 `op_types` 中**追加 Pulsar2 fused op 名**：
+`FullyConnected, Gelu, RotaryEmbedding, RoPE, AxRoPE`（以及原有的 `RMSNormalization, LayerNormalization, MatMul, Add, Mul, Sub, Div, Pow, ReduceMean, Sqrt, Tanh, Softmax, Neg, Slice, Transpose, Reshape, Expand, Cast, Concat, Where, Equal, Unsqueeze, Squeeze, ConstantOfShape`），全部 `data_type=U16, output_data_type=U16`（权重仍 S8；Pulsar2 8.0 的 `weight_data_type` 只允许 S8/FP32）。
+效果：QDType 分布 U16 476 / S16 26 / FP32 1，**503 个节点全部 cos≥0.99928**，终段 0.99998/0.99987/0.99991。
+
+## 第二个坑：chunk2 必须用「chunk1 输出 hidden」做校准
+第一版 c2（用 embedding 校准，链式 cos 只有 **0.754**）在板上也复现为 0.807：chunk2 的真实输入是 chunk1 hidden（实测 min=-437 / max=1105 / mean_abs=19.9），而 embedding 量级只有 ±3 → U16 输入量化 scale 严重偏小、hidden 被裁切。
+修复：新目录 `calib/c2_hidden/` —— 把 16 条校准样本先过 ONNX chunk1，取 **hidden [1,128,1152]** 作为 c2 的 `inputs_embeds` 校准数据，attention_mask 沿用 calib16。重建后链式 cos 0.99968。
+
+## A/B 记录
+| 变体 | 配置 | 结果 |
+|---|---|---|
+| A | S8 权重 + 全 U16 激活（fused 名补齐） | **precision 表 final≈0.9999；仿真链 cos 0.99968 ✅ 采用** |
+| B | A + MatMul `weight_data_type=FP32` | 与 A 的 QDType 分布/精度完全相同（该字段对本图未生效）→ 弃用 |
+| 旧 c2（embedding 校准） | A 配置 | 链 cos 0.754（输入量化 clip 根因）→ 修正为 c2_hidden 校准 |
+| auto（`highest_mix_precision=true`） | — | 实为未量化 FP32（Quant Config 0），AxRoPE FP32 backend 崩 → 排除 |
+| 显式 U16（不含 fused 名） | U16 仅 ONNX op 名 | 节点 196 个仍 U8 → cos 0.90，不达标 |
+
+## 复现命令（20.38）
+```bash
+source ~/work/breeze-tts/env/activate.sh && export PATH=$PULSAR2_HOME/bin:$PATH
+cd ~/work/breeze-tts/textenc
+PY=~/work/breeze-tts/env/venv/bin/python
+# 1) chunk1
+$PY scripts/make_pulsar2_config.py --onnx onnx/textenc_L128_c1of2.onnx --calib-dir calib/calib16 \
+    --build-root build/c1of2_hp --tag textenc_L128_c1of2 --mixed u16 --n-calib 16
+(cd build/c1of2_hp && pulsar2 build --config textenc_L128_c1of2.pulsar2_config.json)
+# 2) chunk2（校准数据 = chunk1 hidden，见 calib/c2_hidden）
+$PY scripts/make_pulsar2_config.py --onnx onnx/textenc_L128_c2of2.onnx --calib-dir calib/c2_hidden \
+    --build-root build/c2of2_hp --tag textenc_L128_c2of2 --mixed u16 --n-calib 16
+(cd build/c2of2_hp && pulsar2 build --config textenc_L128_c2of2.pulsar2_config.json)
+# 3) 仿真：c1 run → 输出作为 c2 输入 → 对比 ONNX 链（详见 simulate/chain_A2_metrics.json、verify/smoke_ref.npz）
+```
+（`scripts/make_pulsar2_config.py` 的 `--mixed u16` 已内置完整 fused op_types 列表。）
+
+## 板端注意
+- 接口不变：`inputs_embeds` f32[1,128,1152] + `attention_mask` f32[1,128] → 段1 hidden[1,128,1152] → 段2 text_embeds[1,128,2048]，取前 T 行。
+- 若板端用旧 c2（链 cos 0.807）请更新为 `sha256 57a9db93…9233d`；参考值见 `verify/smoke_ref.npz`。
+- 两段 axmodel 共 766MB，CMM 可分时加载（段1 用完释放再载段2），不会与 talker 峰值冲突。

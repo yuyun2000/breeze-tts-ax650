@@ -56,3 +56,28 @@ Pulsar2 编译正常，但 **PyTorch CPU 参考推理慢到不可用**；参考�
 - 板端 pyaxengine 的 `run()` 会**严格断言** feed 的 shape/dtype，必须按 `get_inputs(shape_group)` 逐组构造；
 - `speech_tokenizer_decode_post` 的 t64 桶输出 122325 采样（不是 64×1920=122880），按 C++ 的
   `left_context=25 / capacity=39` 分块并最终裁剪到 `T*1920`。
+
+
+## 7. 文本编码器 NPU 混合精度（BONUS：从 0.45 → 0.99968）
+
+T5Gemma2 文本编码器（26 层、hidden 1152，90 GMACs/128 token）在 Pulsar2 8.0 上走了完整的坑，
+最终达标。关键经验（对其它 transformer 编码器同样适用）：
+
+1. **INT8 直接量化不达标**（cos 0.41–0.55）：precision_analysis 显示 MLP 中间激活 (1,128,6912)
+   的 cos 只有 0.07–0.19、"very big range"，RMSNorm/残差 Add 也只有 0.6–0.88。文本模型的
+   embedding 输入动态范围远大于视觉模型，INT8 激活不够。
+2. **只按 ONNX op 名配 U16 也不够（cos 0.90）**：Pulsar2 量化前会做算子融合，融合后的节点
+   （`FullyConnected`、`RMSNormalization`、`RotaryEmbedding`、`Gelu` 等，本图共 196 个）**输出仍是 U8**。
+   必须把这些**融合后的 op 名**也写进 `quant.layer_configs` 的 `op_types` 并设 `data_type/output_data_type=U16`。
+   把这些补上后 precision 表 503 个节点全部 cos≥0.99928。
+3. **`highest_mix_precision=true`（auto）在 Pulsar2 8.0 上不可用**：它实际产出"未量化"图
+   （`Num of Quant Config: [0]`，precision 全 1.0 是假象），并崩在 FP32 `AxRoPE`
+   （`OpBuildException: s1=S(1024,1024) s2=S(32,8192)`）。显式 U16 配置（`RotaryEmbedding` 保持 U16/非 FP32）
+   可绕过。
+4. **两段拆分时，第二段的校准数据必须是第一段 axmodel 的真实输出分布**：我们最初把两段都用
+   text-embedding 分布校准，c2 的输入是 chunk1 hidden（min/max ≈ -437/1105），U16 clip 后链式 cos
+   只有 0.75；改用「真实 prompt → ONNX chunk1 → hidden」做 c2 校准后 **链式 cos 0.99968**。
+5. 权重用 S8、激活全 U16 即可（体积几乎不涨：两段共 766 MB vs INT8 715 MB），
+   板端两段串行编码 196 ms/次，CMM +742 MB 且**用完即释放**（textenc 与 talker 不同时驻留）。
+
+结论：文本编码器已 100% 在 NPU 上（U16/S8 混合精度），与 talker/depth/codec 组成完整 NPU 流水线。

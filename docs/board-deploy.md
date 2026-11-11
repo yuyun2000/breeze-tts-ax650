@@ -43,6 +43,10 @@ python3 runtime/run_breeze_tts.py \
 | depth decoder | `[proj(hidden_norm)]` + 15 步 × 12 层（llm_build --model_type llama）→ post(norm) → 15 个 lm_head | 每帧 15 步；KV cache 32，kv_dim 256 |
 | codec decode | codes [16,T] → decode_pre → 8 层 transformer(滑窗 72) → post → decode_post(t64 分块) | 复用 AXERA Qwen3-TTS speech_tokenizer axmodel |
 
+**文本编码器**：两段 axmodel 串行（`text-encoder/textenc_L128_c1of2.axmodel` → `c2of2.axmodel`），
+runtime 先编码、拿到 text_embeds 后**释放 textenc 的 CMM**（+742 MB，编码 196 ms），再加载 talker/depth；
+也可用 `--text-embeds <npz>` 注入参考 embedding（fallback）。
+
 **fast / quality 两档**：默认 fast（talker + depth INT8 + U16 lm_head，RTF≈11–14×）；`--depth-mode hp`
 切 quality（depth FP32-heavy 1.3 GB，RTF≈23×）。15 个 lm_head 默认使用 `lm-head-hp/`（U16；
 旧 INT8 版输出被 clamp、argmax 会错，不要用于采样）。

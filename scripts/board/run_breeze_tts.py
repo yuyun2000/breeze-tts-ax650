@@ -26,6 +26,7 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
+import gc
 import glob
 import json
 import os
@@ -967,31 +968,37 @@ class TextEncoderRunner:
         mask = np.zeros((1, bucket), dtype=np.float32)
         embeds[0, :L, :] = self.lookup(ids)
         mask[0, :L] = 1.0
-        cur = embeds
-        for m, (ins, outs) in zip(self.models, self.g_io):
+        cur = embeds  # [1, bucket, dim] float32
+        for mi, (m, (ins, outs)) in enumerate(zip(self.models, self.g_io)):
             feed = {}
             for name, (dt, shape) in ins.items():
                 low = name.lower()
                 if "mask" in low:
                     feed[name] = mask.astype(dt)
                 elif len(shape) == 3:
-                    feed[name] = np.ascontiguousarray(cur.astype(dt))
+                    arr = np.asarray(cur)
+                    if arr.ndim == 3 and tuple(arr.shape) == tuple(shape):
+                        feed[name] = np.ascontiguousarray(arr.astype(dt))
+                    else:
+                        if arr.ndim == 3:
+                            arr = arr[0]
+                        if arr.size != int(np.prod(shape)):
+                            raise ValueError("textenc chunk %d input %r: cannot reshape %s -> %s"
+                                             % (mi, name, arr.shape, shape))
+                        feed[name] = np.ascontiguousarray(arr.reshape(shape).astype(dt))
                 elif len(shape) == 2:
                     x = np.zeros(shape, dtype=dt)
                     x[0, :] = np.arange(shape[1], dtype=np.float32).astype(dt)
                     feed[name] = x
-                elif len(shape) == 1:
-                    feed[name] = np.zeros(shape, dtype=dt)
                 else:
                     feed[name] = np.zeros(shape, dtype=dt)
             o = list(m.run(None, feed))
-            cur = o[0]
-            if cur.ndim == 3:
-                cur = cur[0]
-            cur = cur.astype(np.float32)
+            cur = np.asarray(o[0])
+        if cur.ndim == 3:
+            cur = cur[0]
         if cur.shape[0] < L:
             raise RuntimeError("text encoder output has %d rows < prompt %d" % (cur.shape[0], L))
-        return cur[:L].astype(BF16)
+        return cur[:L].astype(np.float32).astype(BF16)
 
 
 # --------------------------------------------------------------------------------------- presets
@@ -1222,6 +1229,9 @@ def synthesize(args) -> dict:
         print("textenc_dir         :", preset.textenc_dir, "exists=", os.path.isdir(preset.textenc_dir))
         print("textenc embed bin   :", preset.textenc_embed_bin,
               "exists=", os.path.exists(preset.textenc_embed_bin or ""))
+        te_models = sorted(glob.glob(os.path.join(preset.textenc_dir or "", "*.axmodel")))
+        print("textenc chunks      : %d %s" % (len(te_models),
+                                               [os.path.basename(x) for x in te_models]))
         print("tokenizer.json      :", preset.tokenizer_json,
               "exists=", os.path.exists(preset.tokenizer_json or ""))
         for name in ("talker_embed_paths", "depth_embed_paths"):
@@ -1336,12 +1346,17 @@ def synthesize(args) -> dict:
             tokens = tok.encode(args.text, args.instruction, args.speaker)
         print("prompt ids (L=%d): %s" % (len(tokens), tokens.tolist()[:40]))
         print("  before textenc:", stats())
+        t_te0 = time.time()
         te = TextEncoderRunner(preset.textenc_dir, preset.textenc_embed_bin,
                                preset.textenc_embed_vocab, preset.textenc_embed_dim, verbose=args.verbose)
+        t_te1 = time.time()
         embeds = te.encode(tokens)
         timings["textenc_s"] = time.time() - t0
-        print("text encoder: L=%d -> %s %.1fms  %s"
-              % (len(tokens), tuple(embeds.shape), timings["textenc_s"] * 1000, stats()))
+        timings["textenc_load_s"] = t_te1 - t_te0
+        timings["textenc_encode_s"] = time.time() - t_te1
+        print("text encoder: L=%d -> %s %.1fms (load %.1fs + encode %.0fms)  %s"
+              % (len(tokens), tuple(embeds.shape), timings["textenc_s"] * 1000,
+                 timings["textenc_load_s"], timings["textenc_encode_s"] * 1000, stats()))
         if not args.keep_textenc:
             del te
             gc.collect()

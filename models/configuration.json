@@ -74,13 +74,21 @@
     "eoi_embedding": "text-encoder/eoi_embedding.npy",
     "embedding_scale": 33.941125,
     "tokenizer_dir": "text-encoder/tokenizer",
-    "status": "npu_axmodel_not_delivered_pulsar2_axrope_fp32_bug",
+    "status": "delivered_npu",
     "protocol": [
       "inputs_embeds:float32[1,128,1152]",
       "attention_mask:float32[1,128]",
       "-> chunk1 -> [1,128,1152] -> chunk2 -> [1,128,2048]"
     ],
-    "note": "NPU axmodel 受 Pulsar2 8.0 混合精度 AxRoPE 后端 bug 阻塞；demo/板端用 --text-embeds 注入参考 embedding（encode_text_embeds.py 可复现）"
+    "note": "两段串行；embedding 查表在 CPU（bf16 LUT + embed_scale + eoi 替换）；板端实测 196ms/次（34 token, L=128 桶）、CMM +742MB（编码后释放）",
+    "chunk1_axmodel": "text-encoder/textenc_L128_c1of2.axmodel",
+    "chunk1_size": 381721897,
+    "chunk1_sha256": "80bed2d805b600e6d58a6516a7f269f65a4b263a1aba9b42d835e25ae52c2c2f",
+    "chunk2_axmodel": "text-encoder/textenc_L128_c2of2.axmodel",
+    "chunk2_size": 384311393,
+    "chunk2_sha256": "57a9db9399e0cece2ad1f4d3d1864860bda7be0e8d6a40713f7fb03fef19233d",
+    "precision": "U16 activations + S8 weights (fused-op-aware layer_configs, calib16)",
+    "sim_chain_cos": 0.9996766
   },
   "speech_tokenizer": {
     "decode_pre_axmodel": "speech-tokenizer/speech_tokenizer_decode_pre_inproj.axmodel",
