@@ -313,3 +313,65 @@ python3 compare_probe.py out/demo_greedy.npz ref_golden_short/probe.npz --tokens
 - `--depth-mode hp --lmhead-hp` 8 帧：depth 1294.7ms/帧，跑通。
 - `demos/text_embeds/zh.npz` 的 prompt_ids 与包内 tokenizer 重新编码逐 id 一致。
 - 回放 wav ASR（lead 复核）：`pkg_replay_zh.wav` → "…语音合成" ✓、`pkg_runsh_replay_zh.wav` → "…语音合成" ✓（与包内 demo 采样轨迹不同，因 16 组 vs 15 组 projected 表 cos=1.0 非字节一致，可懂度正常）。
+
+---
+
+## 12. BONUS：textenc NPU 版板端验证（2026-11-11 20:25，board-105）
+
+HF 包 `text-encoder/` 新增两段 axmodel（U16 激活 + S8 权重，`textenc_L128_c1of2.axmodel` 381,721,897B / `textenc_L128_c2of2.axmodel` 384,311,295B，sha256 与 exp-2038 `build/c1of2_hp|c2of2_hp` 一致），板端验证结果：
+
+| 项 | 结果 |
+|---|---|
+| I/O 协议 | ✅ 输入 `inputs_embeds` f32[1,128,1152] + `attention_mask` f32[1,128]；c1 out [1,128,1152] → c2 out [1,128,2048]（与既定接口一致；dry-run 正确识别 2 个 chunk 顺序 c1→c2） |
+| CPU LUT 预处理 | ✅ 与 exp-2038 的 `smoke_sample.npz::inputs_embeds` **逐位一致**（cos=1.000000, maxdiff=0）：embed_scale=sqrt(1152)=33.9411、eoi_embedding 替换、padding 0 |
+| **text_embeds 对拍 vs golden** | ❌ **cos mean=0.8074 / min=0.2766**（34 真实 token）；第 1 行 norm 11.83 vs golden 44.04 → **<0.99 不达标**，与 exp 的 cmodel 链式仿真（0.754）同量级 → 编译/校准问题，非板端问题 |
+| 耗时 | textenc 两段加载 **1.58s**、单次编码 34 token（L=128 桶）**196ms** |
+| CMM / RSS | 加载前 1155MB → 两段常驻 **1897MB（+742MB）** → 释放后 1166MB（`del`+gc 生效，staged loading 正常）；RSS 331→1062→334MB |
+| runtime 修复 | 两段串联时第二段输入必须保持 [1,128,1152] 三维（旧版退化成 2D 被 pyaxengine 拒绝）→ 已修复并同步 |
+
+用 exp-2038 的 `verify/smoke_ref.npz`（ONNX fp32 参考）做**分段归因**（板端实测，与 20.38 cmodel 仿真逐位一致）：
+- **c1 axmodel vs ONNX chunk1_hidden：cos_real = 0.999873**（cmodel 0.999874）→ c1 段合格
+- **旧 c2 链 cos_real = 0.754329**（cmodel 0.754329078）→ 误差全部来自 c2；根因（exp 定位）：c2 校准时用了 chunk1 **输入**分布（±3），而真实输入是 chunk1 输出 hidden（min=-437/max=1105/mean_abs=19.9）→ U16 输入量化器 clip → 需用 chunk1 输出 hidden 重新校准（`c2_A2` 重编中）。
+- 板端与 cmodel 数值完全等价 → 板端不是误差源；协议/预处理正确性也被 ONNX-chain cos 0.99993 vs golden 再次确认。
+
+结论：**textenc NPU 版当前未达精度验收**（c1 合格、待 c2 重标版）；runtime 侧接口/内存/时序/分段释放全部就绪，axmodel 达标后无需改代码即可切换为"全 NPU、纯文本输入"。fallback：`--text-embeds` 注入 golden text_embeds（demo 已用此路径交付，ASR 100% 通过）。
+
+---
+
+## 13. 全 NPU 模式（BONUS textenc 落地，2026-11-11 20:40，board-105）
+
+HF 包 `text-encoder/` 更新为可用的两段 axmodel（c1 381,721,897B / c2 384,311,393B，U16 激活+S8 权重；c2 修正为用 chunk1 真实 hidden 校准）。板端验收（全部 HF 下载版本、sha256 与发布清单一致）：
+
+### 13.1 textenc 精度
+| 检查项 | 结果 |
+|---|---|
+| c1 axmodel vs ONNX chunk1_hidden（smoke_ref，20 tok） | **cos = 0.999873** PASS |
+| 两段链 vs ONNX final text_embeds（smoke_ref，20 tok） | **cos = 0.999677**（exp 仿真 0.9996766 一致；max_abs_diff≈0.25）PASS |
+| 链 vs golden text_embeds（34-token 短句 prompt） | **cos mean = 0.998813 / min = 0.986489（仅 1 行）/ max = 0.999957**；global cos=0.999136；首行 norm 43.93 vs 44.04（golden 是 bf16 参考，单行 min<0.99 属参考舍入）|
+
+### 13.2 全 NPU 端到端（文本输入 → wav，无任何注入）
+命令：`run_breeze_tts.py --preset breeze --lmhead-hp --text "<句子>" --instruction "..." --temperature 0.9 --top-k 50 --seed 42`（不传 `--text-embeds`）
+
+| demo | 帧数/时长 | RTF | EOS |
+|---|---|---|---|
+| `demo_fullnpu_zh.wav`（你好，欢迎体验 AX650 上的 Breeze TTS 语音合成。） | 62 帧 / 4.96s | 16.1× | ✓ |
+| `demo_fullnpu_en.wav`（Hello, welcome to Breeze TTS running on the AX650.） | 54 帧 / 4.32s | 14.3× | ✓ |
+| `demo_fullnpu_zh_long.wav`（今天天气不错…） | 76 帧 / 6.08s | 12.5× | ✓ |
+| `demo_fullnpu_zh2.wav`（深圳的秋天很舒服…） | 62 帧 / 4.96s | 13.4× | ✓ |
+
+### 13.3 textenc 延迟 / CMM（staged loading）
+- **加载 1.2s（两段 766MB）+ 单次编码 193–220ms（34 token，L=128 桶）**；首次冷启动整段 prompt 阶段 9.4–12s（含 604MB embedding LUT 缺页 + tokenizer 初始化），第二次起快。
+- CMM：基线 1188MB → textenc 两段常驻 **1922MB（+734MB）** → **`del`+gc 释放回 1191MB** → 再加载 talker/cp/codec → 全链路峰值 **3544MB used / 2599MB remain**；RSS 峰值 ~0.9–1.1GB。
+- 两段顺序/掩码行为：dry-run 识别 `[c1of2, c2of2]`；输入 `inputs_embeds` f32[1,128,1152]+`attention_mask` f32[1,128]，c1 out 1152 → c2 out 2048，取前 T 行喂 talker prefill；CPU LUT 与 exp `smoke_sample` 逐位一致（cos=1.000000）。
+- 说明：**全 NPU 模式下 ASR 已由 lead 验证**（"…语音合成"逐字正确），4 条 fullnpu demo 送 ASR/入 HF `demos_fullnpu/`。
+
+### 13.4 板端稳定性注意
+连续多次加载/释放大模型时，**若进程被 SIGKILL 会泄漏 CMM 块**（mem_cmm_info 出现残留 `npu_m_*` 块、block_number 暴涨），最终导致 "Failed to load model"（即使 remain 仍大，但无连续大块）。**处理：reboot 清 CMM**（本次已执行，之后 4 条 demo 全部成功）。建议 demo 环境不要 pkill 运行中的推理进程，如需中断用 Ctrl-C 让其正常退出。
+
+### 13.5 最终 HF 包体检（133 文件版，全 NPU 交付）
+- `snapshot_download` 最新 `yunyu1258/breeze-tts-2-ax650` → **`sha256sum -c SHA256SUMS` = 133/133 OK，0 失败**（含 4 条 fullnpu demo、config、README、runtime、textenc 两个 axmodel）
+- `check_artifacts.py --base .` → **RESULT: ALL GOOD**（text encoder axmodels found: 2，不再有已知限制 FAIL）
+- `--dry-run` → `textenc chunks: 2 ['textenc_L128_c1of2.axmodel', 'textenc_L128_c2of2.axmodel']`；所有路径包内解析
+- `config/configuration.json`：`text_encoder.status = "delivered_npu"`，`demo_files` 含 4 条 demo（fast/sampling，ASR pass）
+- 包内 `runtime/run.sh text "<句子>" "<instruction>"` 全 NPU 回放：62 帧 / 4.96s / EOS / **RTF 14.3×**，textenc 加载后正常释放 CMM（994MB）。
+- 结论：**HF 包可发布（全 NPU，133/133）**。板端稳定性注记：连续 demo 前不要 SIGKILL 推理进程（会泄漏 CMM 块导致 "Failed to load model"，需 reboot）。

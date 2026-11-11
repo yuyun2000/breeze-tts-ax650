@@ -56,6 +56,12 @@ case "${1:-demo}" in
     python3 "$RT/run_breeze_tts.py" $COMMON --text "${2:?text}" \
       --instruction "${3:-一位温柔自信的年轻女性，声音清晰，语气亲切。}" \
       --out-wav "$OUT/demo_text.wav" --dump-tokens "$OUT/demo_text.npz" ;;
+  demo-npu)
+    # fully-NPU path: text -> textenc axmodels -> talker -> depth -> codec (requires textenc axmodels)
+    python3 "$RT/run_breeze_tts.py" $COMMON \
+      --text "你好，欢迎体验 AX650 上的 Breeze TTS 语音合成。" \
+      --instruction "一位温柔自信的年轻女性，声音清晰，语气亲切。" \
+      --out-wav "$OUT/demo_npu.wav" --dump-tokens "$OUT/demo_npu.npz" | tee "$OUT/demo_npu.log" ;;
   codes) python3 "$RT/run_breeze_tts.py" --preset breeze --breeze-base "$PKG" --codes "${2:?npz}" \
            --out-wav "${3:-$OUT/codec_decoded.wav}" ;;
   check) python3 "$RT/check_artifacts.py" --base "$PKG" ;;
