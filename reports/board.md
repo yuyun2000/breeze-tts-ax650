@@ -9,7 +9,7 @@
 | 阶段 | 实测 | 备注 |
 |---|---|---|
 | 模型加载 | talker 28 层 7.9 s；depth 12 层 2.5 s；codec 0.8 s；embedding 页缓存预热 0.67 s | |
-| 文本编码器（两段 NPU） | 加载 1.58 s；编码（34 token, L=128 桶）**196 ms**；CMM +742 MB 后释放；链式 cos **0.99968** vs ONNX fp32 | |
+| 文本编码器（两段 NPU） | 加载 1.2–1.6 s；编码（34 token, L=128 桶）**193–196 ms**（首次冷启动含 604 MB LUT 缺页约 9.4 s）；CMM +734–742 MB 后释放；链式 cos **0.99968**（仿真）/ **0.9988 row-mean（板端 vs golden）** | |
 | talker prefill (L=34) | **398 ms** | 1 个 128 token chunk |
 | talker decode / 帧 | **133–146 ms**（均值 ~140） | 28 层，kv 512 |
 | depth decoder / 帧 | **564–758 ms**（15 步 × 12 层 INT8 + lm_head；`--lmhead-cpu` 时 CPU fp32 兜底；U16 lm_head 上 NPU 后实测 ~506 ms/帧） |
@@ -31,6 +31,7 @@ quality 模式（depth FP32-heavy 1.3 GB）实测进行中：每帧预计 1.5–
 | depth teacher-forced（golden codes 输入） | INT8: logits cos 0.99914、top1 96%；free-run 在 frame0 第 3 步分叉（量化近 tie 翻 argmax）。hp(FP32): cos 0.99927、top1 95.6%（与 bf16 参考不可约）、free-run 平均 code match 0.90（INT8 0.81） |
 | **15 个 lm_head** | 旧 INT8 输出被 clamp（2051 logits 仅 ~150 unique、argmax 错）；**U16 版本修复**：unique 1662–1917、cos 0.999963–0.999994、top1 与 CPU fp32 一致（100%），NPU 比 CPU heads 快 ~50 ms/帧 |
 | codec（同一份 golden codes 过板端 vocoder） | 长度精确一致 122880 samples；**幅度谱相关 0.99958**、能量包络 0.84；波形相位差来自 vocoder 实现差异，不影响内容 |
+| **全 NPU 端到端**（textenc + talker + depth + codec，无任何注入） | 短句 4.96 s，ASR "…语音合成" ✓；textenc 板端 cos 0.9988/global 0.9991 |
 | **ASR（paraformer-zh + SenseVoice 双模型）** | **4 条 demo 采样模式全部与输入文本一致**：中文短句 "...语音合成" ✓；长句 "今天天气不错我们一起出去走走吧你觉得去哪里比较好呢" 逐字 ✓；英文 "Hello, welcome to Breeze TTS running on the AX650." ✓；中文场景句 "深圳的秋天很舒服，周末我想去海边走走，顺便拍几张照片。" 逐字 ✓。greedy 模式短句丢最后音节（depth 分叉），仅作 token 对拍基准 |
 
 ## 3. 结论
