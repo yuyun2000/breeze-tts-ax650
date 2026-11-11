@@ -290,3 +290,26 @@ python3 compare_probe.py out/demo_greedy.npz ref_golden_short/probe.npz --tokens
 4. pyaxengine 无法零拷贝 K/V，每帧 28×8.4MB memmove；用 ax-llm C++ 运行时或自定义 buffer 可省 ~25% talker 时间。
 5. textenc axmodel 落地后去掉 `--text-embeds`，实现真正"全 NPU、纯文本输入"。
 6. 多句 demo 与长文本分段拼接（codec 127 帧上限）。
+
+---
+
+## 11. HF 包发布前验证补丁（2026-11-11 19:45，board-105）
+
+对 `yunyu1258/breeze-tts-2-ax650` 全新下载（129 文件 / 4.2GB）做只读验证时发现并修复 **2 个 runtime bug**（模型产物本身全部通过：SHA256 126/128 文件 OK，仅 README 行与 make_sha256.sh 缺文件，属打包问题）。修复版文件：
+
+| 文件 | size | sha256 |
+|---|---|---|
+| `runtime/run_breeze_tts.py`（修复版，必须替换） | 78864 | `143156fe3e194873e43f2614f20a083ac4c5f1276caa0a2ab213b6ca7a4fd9c1` |
+| `runtime/check_artifacts.py`（未变） | 10568 | `3eb8e310e35f092d005e093a8f61dfca7e2ac31e14eab0ce7f5b64926d3f033b` |
+| `runtime/run.sh`（未变） | 2994 | `7c280d033bc8e822dc5bea25a08fe9d226f6fc19fddfe1e6dac45adc713737ac` |
+
+**Bug 1 — depth 输入表解析错误（危险）**：旧 `find_embed_file()` 对 depth projected 表先按"15 组尺寸 63,006,720B"搜索，未命中后按字节数兜底，而 HF 包内 projected 表是 **16 组**（`proj_audio_embed_16x2051x1024.bfloat16.bin`，67.2MB），兜底因此命中**同字节大小的 `codebooks_head_15x1024x2051.bf16.bin`**——把 lm_head 权重误当成 depth embedding 表，会静默产生垃圾音频。修复：depth 表只按文件名模式匹配（15 组或 16 组），去掉 size 兜底；16 组文件按 group-major 支持。
+**Bug 2 — depth proj 布局判别错误**：包内 `depth_proj_2048x1024.bfloat16.bin` 的有效矩阵是 `W = file.reshape(1024,2048).T`（等价 out_in 布局），旧版按文件名 `_2048x1024` 判成 "in_out" → 投影错误。修复：数值自动判别（用包内 E' = A·P 关系试两种布局取 cos 高者；实测 cos=1.00000 选中 out_in）。
+
+**修复验证（板端，用 HF 包数据 + 新 runtime）**：
+- `--dry-run`：`depth embeds = proj_audio_embed_16x2051x1024.bfloat16.bin groups=16`、`depth proj layout auto-detect: out_in (cos=1.00000)`，所有路径包内解析、无 /root 回退。
+- `check_artifacts --base .`：除 textenc（已知限制）全 OK。
+- `run.sh demo` 回放（包内 demos/text_embeds/zh.npz + lm-head-hp）：54 帧 EOS、4.32s、RTF 11.3×。
+- `--depth-mode hp --lmhead-hp` 8 帧：depth 1294.7ms/帧，跑通。
+- `demos/text_embeds/zh.npz` 的 prompt_ids 与包内 tokenizer 重新编码逐 id 一致。
+- 回放 wav ASR（lead 复核）：`pkg_replay_zh.wav` → "…语音合成" ✓、`pkg_runsh_replay_zh.wav` → "…语音合成" ✓（与包内 demo 采样轨迹不同，因 16 组 vs 15 组 projected 表 cos=1.0 非字节一致，可懂度正常）。
