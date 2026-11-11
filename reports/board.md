@@ -12,7 +12,7 @@
 | 文本编码器 | 未计入（本次 demo 用 golden text_embeds 注入；NPU 版本见 §5） | |
 | talker prefill (L=34) | **398 ms** | 1 个 128 token chunk |
 | talker decode / 帧 | **133–146 ms**（均值 ~140） | 28 层，kv 512 |
-| depth decoder / 帧 | **564–758 ms**（15 步 × 12 层 + 15 lm_head CPU fp32 兜底；波动来自 CPU 侧 lm_head/采样） |
+| depth decoder / 帧 | **564–758 ms**（15 步 × 12 层 INT8 + lm_head；`--lmhead-cpu` 时 CPU fp32 兜底；U16 lm_head 上 NPU 后实测 ~506 ms/帧） |
 | codec decode / 句 | **522 ms（5.12 s）/ 1249 ms（6.72 s）** | decode_pre + 8 层 transformer + 分块 vocoder |
 | **端到端（采样模式，短句 64 帧）** | **72.2 s / 5.12 s 音频 = RTF 14.1×** | 其中 talker 9.36 s + depth 48.5 s + codec 0.52 s + prefill 0.43 s |
 | **端到端（采样模式，长句 84 帧）** | **73.4 s / 6.72 s 音频 = RTF 10.9×** | talker 11.57 s + depth 47.3 s + codec 1.25 s |

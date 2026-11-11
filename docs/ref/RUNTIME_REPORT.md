@@ -15,7 +15,7 @@
 | 板端全链路（文本 embedding → talker 28 层 → depth 12 层×15 步 → codec 8 层+vocoder → 24k wav） | ✅ **跑通，产出可听中文语音** |
 | **默认 demo 模式（fast/INT8 depth，采样 temp0.9/top_k50）** | **RTF ≈ 11–14×**；ASR（paraformer-zh）**逐字 100% 正确**（短句、长句各 1 条，SenseVoice 交叉验证一致） |
 | quality 模式（hp/FP32 depth） | RTF ≈ 23×；free-run code match 0.81→0.90；teacher-forced top1 与 INT8 持平（见 §5） |
-| 关键模块精度 | talker frame0 logits top5 与 golden **完全一致**；codec 复用的幅度谱相关 **0.9996**；depth 为当前唯一误差源 |
+| 关键模块精度 | talker frame0 logits top5 与 golden **完全一致**；codec 复用的幅度谱相关 **0.9996**；depth 为当前唯一误差源（teacher-forced 96%，bf16 参考不可约）；15 个 lm_head 已由 repack 重编 U16 修复（NPU 可用，-50ms/帧） |
 | 资源 | fast: CMM 3471MB/6144、RSS ~1.0GB；hp: CMM 4394MB、RSS ~1.1GB；板端 free 12G |
 | textenc | **未上线**（Pulsar2 AxRoPE FP32 backend bug + INT8 精度不达标）；demo 用 golden `text_embeds` 注入 → **除 textenc 外全 NPU**，作为已知限制交付 |
 
@@ -79,7 +79,7 @@ Presets：`breeze`（正式）/ `qwen3tts06`（AXERA 0.6B 包胶水自检）。
 |---|---|---|
 | talker prefill L=34（1×128 chunk，28 层） | **398 ms** | 固定成本 |
 | talker decode（28 层 + post） | **136.4–138.5 ms/帧** | ≈4.9ms/层；kv_cache_len=512 |
-| depth（15 步 × 12 层 + post + CPU 15 heads） | **560–758 ms/帧**（典型 ~560；个别轮次系统抖动到 758） | 37–50ms/步（含 15 个 CPU head ~40-60ms） |
+| depth（15 步 × 12 层 + post + 15 heads） | **506 ms/帧**（U16 NPU heads）/ **556 ms/帧**（CPU fp32 heads 兜底）/ 个别轮次系统抖动到 758 | 34–37ms/步 |
 | codec decode（64 帧，1 桶 vocoder） | **510–522 ms** | decode_pre 20 + transformer prefill 23 + post 26 + vocoder 456 |
 | codec decode（84 帧，2 桶） | 1249 ms | 长句按 39 帧/桶追加 ~456ms/桶 |
 | 模型加载 | talker 8.5s、cp 2.5s、codec 0.6–0.9s | 合计 ~12s |
@@ -177,7 +177,7 @@ golden 参考是 PyTorch **bf16** 推理（logits 以 bf16 计算/保存），bf
 ### 6.2 **15 个 depth lm_head axmodel 的输出量化坏了**（必须知道）
 - 单次推理 2051 个 logits 只有 **~150 个不同值**（int8 输出 clamp/round），范围 ±5；golden logits 达 ±16 → frame0 step0 argmax 直接错（91 vs 1380）。
 - 改用 **CPU fp32 matmul**（`codebooks_head_15x1024x2051.bf16.bin` 预载 fp32 126MB）后：step0 logits cos=**0.99977**、top5 与 golden 完全一致；代价 ~40-60ms/帧。
-- 建议（下一版）：lm_head 重编时去掉输出量化/改 U16；修复后可换回 NPU（可省 ~40ms/帧）。
+- **后续已修复**：repack 重编了 15 个 U16 输出 head（`builds/lm-head-hp/`，2.28MB/个），实测与 CPU fp32 等价（teacher-forced cos 0.99898 vs 0.99899、top1 完全相同 0.9467），且 **NPU 版更快**：depth 506 vs 556 ms/帧（省 ~50ms/帧）。**runtime 默认自动使用 axmodel heads**；`--lmhead-cpu` 保留作为交叉验证/兜底。旧 int8 heads 备份在 `builds/lm-head-int8-backup/`。
 
 ### 6.3 其他
 - pyaxengine `del session; gc.collect()` **能释放 CMM**（实测 2 层 122MB→释放回 8MB）→ textenc 可"先用后释放"分阶段加载（`--keep-textenc` 可保持常驻）。
@@ -199,6 +199,32 @@ golden 参考是 PyTorch **bf16** 推理（logits 以 bf16 计算/保存），bf
 6. 板端 1.9GB 内存下建议停 M5Stack `llm-*` 服务与 axllm 以获得最佳余量（当前 demo 在它们运行下也通过）。
 
 ---
+
+## 7.5 包布局兼容（HF 发布用）
+
+runtime 同时支持两种布局，路径自动探测（`--dry-run` 可打印解析结果）：
+
+```
+HF 包布局（推荐发布形态）              板端工作区布局
+<pkg>/talker/*.axmodel                 <base>/builds/talker/*.axmodel
+<pkg>/code-predictor/*.axmodel         <base>/builds/code-predictor/*.axmodel
+<pkg>/code-predictor-hp/*.axmodel      <base>/builds/code-predictor-hp/*.axmodel
+<pkg>/lm-head-hp/*.axmodel             <base>/builds/lm-head-hp/*.axmodel
+<pkg>/embeds/*.bin                     <base>/embeds/*.bin
+<pkg>/speech-tokenizer/...             （旧路径 /root/breeze-tts/qwen3tts-ref/speech_tokenizer）
+<pkg>/text-encoder/text_embed_...bin + eoi_embedding.npy + tokenizer/   （<base>/textenc + <base>/tokenizer）
+<pkg>/runtime/{run_breeze_tts.py,run.sh}
+```
+
+```bash
+cd <pkg> && LD_LIBRARY_PATH=/soc/lib python3 runtime/run_breeze_tts.py --preset breeze --dry-run
+# 默认 --breeze-base 自动：当前目录像包 → 用它；否则 /root/breeze-tts/breeze
+# --depth-mode fast|hp（hp 用 code-predictor-hp）；--lmhead-hp（用 lm-head-hp 的 U16 heads）
+# --codes / --text-embeds / --lmhead-cpu / --probe-frames 等不变
+```
+已在板上用模拟 HF 布局（/tmp/pkg_hf，symlink 到真实产物）验证：dry-run 全路径解析正确、真实 8 帧推理跑通、check_artifacts 除 textenc（已知限制）全 OK。
+
+**U16 lm_heads（`lm-head-hp/`，2.28MB/个）实测**：teacher-forced cos 0.99898 vs CPU fp32 0.99899、top1 完全相同（0.9467），**NPU 比 CPU 快 ~50ms/帧**（506 vs 556ms）→ runtime 默认优先使用（`--lmhead-hp` 或在 cp 目录内直接替换）；旧 int8 heads 备份在 `builds/lm-head-int8-backup/`，`--lmhead-cpu` 保留作交叉验证/兜底。
 
 ## 8. 复现命令
 

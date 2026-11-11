@@ -63,7 +63,7 @@ python3 runtime/run_breeze_tts.py \
 | talker decode | 133–146 ms/帧（28 层 INT8，kv 512） |
 | depth decoder（15 步 × 12 层） | 564–758 ms/帧（INT8 fast） / 1433 ms/帧（hp quality） |
 | codec decode | 0.5–1.25 s/句 |
-| 整句端到端 | 5.12 s 音频 **72.2 s（RTF 14.1×）**；6.72 s 音频 **73.4 s（RTF 10.9×）** |
+| 整句端到端 | 5.12 s 音频 **72.2 s（RTF 14.1×）**；6.72 s 音频 **73.4 s（RTF 10.9×）**（demo 生成时 lm_head 在 CPU；U16 NPU head 后 depth 省 ~50 ms/帧，预期 RTF ~11×） |
 | 资源 | CMM 3.47 GB（fast）/ 4.39 GB（hp）；python RSS ~1.1 GB |
 | 精度 | talker frame0 logits 与 PyTorch 参考 top5 逐位一致；codec 同 codes 幅度谱相关 0.99958 |
 | ASR 验收 | 采样模式：中文短句/长句经 paraformer-zh + SenseVoice 转写**与输入文本一致** |

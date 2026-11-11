@@ -31,9 +31,9 @@ qwen3 / θ=1e6 / 普通 RoPE）；只有 depth decoder 真正用 llama3 rope。P
 | 项 | 结果 |
 |---|---|
 | talker decode | **133–146 ms/帧**（28 层 INT8，kv 512） |
-| depth decoder | **564–758 ms/帧**（15 步 × 12 层 INT8 + 15 个 lm_head CPU 兜底） |
+| depth decoder | **≈500–570 ms/帧**（15 步 × 12 层 INT8 + U16 lm_head 在 NPU；`--lmhead-cpu` 可兜底） |
 | codec decode | 522 ms（5.12 s 音频）/ 1249 ms（6.72 s） |
-| 整句端到端 | 短句 **72.2 s / 5.12 s = RTF 14.1×**；长句 **73.4 s / 6.72 s = RTF 10.9×** |
+| 整句端到端（已交付 demo，含 CPU-head 兜底） | 短句 **72.2 s / 5.12 s = RTF 14.1×**；长句 **73.4 s / 6.72 s = RTF 10.9×**；U16 head 全 NPU 后 depth 约省 50 ms/帧（预期 RTF ~11×） |
 | 资源 | CMM 3471 MB / 6144 MB；python RSS ~1.1 GB；模型加载 ~11 s |
 | 精度 | talker frame0 logits 与 PyTorch 参考 **top5 逐位一致**、output_norm cos 0.99942；codec 同 codes 幅度谱相关 0.99958 |
 | **ASR 验收** | 4 条 demo（中文短句/长句/英文/中文场景句）采样模式经 paraformer-zh + SenseVoice 转写**全部与输入文本一致**；hp 对照版本同样通过（见 `docs/ref/RUNTIME_REPORT.md`） |
