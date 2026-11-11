@@ -164,6 +164,30 @@
     {
       "file": "demos/reference/codec_parity_golden_short.wav",
       "note": "同一份 golden codes 经板端 codec 解码，与 PyTorch 参考幅度谱相关 0.99958"
+    },
+    {
+      "file": "demos/demo_zh_short_fullnpu.wav",
+      "text": "你好，欢迎体验 AX650 上的 Breeze TTS 语音合成。",
+      "mode": "full-NPU/sampling",
+      "asr": "pass"
+    },
+    {
+      "file": "demos/demo_zh_long_fullnpu.wav",
+      "text": "今天天气不错，我们一起出去走走吧。你觉得去哪里比较好呢？",
+      "mode": "full-NPU/sampling",
+      "asr": "pass"
+    },
+    {
+      "file": "demos/demo_en_fullnpu.wav",
+      "text": "Hello, welcome to Breeze TTS running on the AX650.",
+      "mode": "full-NPU/sampling",
+      "asr": "pass"
+    },
+    {
+      "file": "demos/demo_zh2_fullnpu.wav",
+      "text": "深圳的秋天很舒服，周末我想去海边走走，顺便拍几张照片。",
+      "mode": "full-NPU/sampling",
+      "asr": "pass"
     }
   ]
 }

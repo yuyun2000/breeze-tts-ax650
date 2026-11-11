@@ -51,6 +51,8 @@ python3 runtime/run_breeze_tts.py \
   --text "今天天气不错，我们一起出去走走吧。你觉得去哪里比较好呢？" \
   --instruction "用温柔亲切的女声，语速稍慢。" \
   --out out.wav --dump-tokens tokens.npz
+# 全程 NPU：文本编码器（两段 axmodel）→ talker → depth → codec；textenc 用完即释放 CMM
+# 可选：--depth-mode hp 切 quality 模式；--text-embeds <npz> 用参考 embedding 跳过文本编码器
 ```
 
 采样模式默认（官方参数：backbone temperature 0.9 / top_k 50 / repetition_penalty 1.1；depth 同）。
@@ -67,7 +69,7 @@ python3 runtime/run_breeze_tts.py \
 | 整句端到端 | 5.12 s 音频 **72.2 s（RTF 14.1×）**；6.72 s 音频 **73.4 s（RTF 10.9×）**（demo 生成时 lm_head 在 CPU；U16 NPU head 后 depth 省 ~50 ms/帧，预期 RTF ~11×） |
 | 资源 | CMM 3.47 GB（fast）/ 4.39 GB（hp）；python RSS ~1.1 GB |
 | 精度 | talker frame0 logits 与 PyTorch 参考 top5 逐位一致；codec 同 codes 幅度谱相关 0.99958 |
-| ASR 验收 | 采样模式：中文短句/长句经 paraformer-zh + SenseVoice 转写**与输入文本一致** |
+| ASR 验收 | **全 NPU 链路**（无注入）4 条 demo（中短/中长/英文/场景句）经 paraformer-zh 转写**与输入文本一致** |
 
 ## 已知限制
 
