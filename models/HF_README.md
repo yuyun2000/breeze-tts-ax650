@@ -27,12 +27,12 @@ tags:
 > 转换/运行代码 Apache-2.0。Qwen3-TTS tokenizer 组件版权归 QwenLM（Apache-2.0）。
 > `speech-tokenizer/` 中的 axmodel 复用自 AXERA 公开仓库（见 `NOTICE`）。
 
-## 包内容（约 3.8 GB）
+## 包内容（约 4.5 GB）
 
 | 路径 | 说明 | 体积 |
 |---|---|---|
 | `talker/` | Qwen3 式 28 层（hidden 2048）per-layer axmodel + post（final norm + lm_head 2048→2052） | 1.63 GB |
-| `code-predictor/` | Llama 式 12 层（hidden 1024, kv 256）per-layer axmodel + post(norm) + 15 个位置相关 lm_head axmodel | 0.40 GB |
+| `code-predictor/` | Llama 式 12 层（hidden 1024, kv 256）per-layer axmodel + post(norm) + 15 个位置相关 lmmodel（INT8）；U16 版在 `lm-head-hp/` | 0.40 GB |
 | `embeds/` | 16 组未投影音频 embedding 表（talker 帧求和）+ 15 组投影表（depth 输入）+ depth 投影矩阵 | 0.21 GB |
 | `text-encoder/` | T5Gemma2 文本编码器：CPU embedding LUT（bf16）+ tokenizer；NPU axmodel 见下方"已知限制" | 0.61 GB |
 | `speech-tokenizer/` | Qwen3-TTS Tokenizer 12Hz decoder（decode_pre + 8 层 transformer + decode_post），**复用 AXERA 已编译产物** | 0.16 GB |

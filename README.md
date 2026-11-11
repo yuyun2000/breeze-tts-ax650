@@ -4,7 +4,7 @@
 Artificial Analysis TTS 榜单开源第一）转换并部署到 **AX650/AX8850 NPU**：完整的转换流水线 +
 板端纯 Python 运行时（numpy + pyaxengine，无 PyTorch）+ 可复现实测报告。
 
-> 🤗 **模型包（axmodel + runtime，约 3.8 GB）**：<https://huggingface.co/yunyu1258/breeze-tts-2-ax650>
+> 🤗 **模型包（axmodel + runtime，约 4.5 GB）**：<https://huggingface.co/yunyu1258/breeze-tts-2-ax650>
 >
 > ⚠️ **许可证**：Breeze TTS 2 的**模型权重、衍生模型与自托管输出仅限研究与非商业用途**
 > （BreezeBlue Research and Non-Commercial License 1.1，见 [licenses/BREEZEBLUE_LICENSE.txt](licenses/BREEZEBLUE_LICENSE.txt)）。
