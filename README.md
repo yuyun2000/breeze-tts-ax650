@@ -61,8 +61,9 @@ cd /root/breeze-tts/web && bash start.sh
 | `GET /api/jobs/<id>` | 进度 + 耗时分解（含 RTF、逐帧耗时） |
 | `GET /api/jobs/<id>/audio.wav` | 下载 WAV |
 
-详见 [web/README.md](web/README.md)。实测：一句 4.7–6.2 s 音频约 **67–82 s**（RTF 13–14×，全 NPU），
-单 worker 串行队列；页面上有示例音频可先试听。
+详见 [web/README.md](web/README.md)。服务内置**常驻（warm）引擎**：模型只加载一次，之后每句
+4.7–6.2 s 音频约 **42–55 s（RTF ≈ 8–9×）**；未常驻/重启后首句约 68 s。单 worker 串行队列，
+页面上有示例音频可先试听。
 
 ### 命令行 / Python 调用
 

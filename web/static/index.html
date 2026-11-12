@@ -81,6 +81,7 @@ a{color:var(--hi);text-decoration:none}
   </div>
   <div class="badges">
     <div class="badge live" id="bStatus">● 服务在线</div>
+    <div class="badge" id="bWarm">常驻 —</div>
     <div class="badge" id="bCmm">CMM —</div>
     <div class="badge" id="bQueue">队列 0</div>
   </div>
@@ -100,13 +101,13 @@ a{color:var(--hi);text-decoration:none}
     </div>
   </div>
   <div class="modes">
-    <div class="mode active" data-mode="fast"><div class="t">⚡ 快速模式</div><div class="d">depth INT8 + U16 lm_head · RTF ≈ 12–16×</div></div>
-    <div class="mode" data-mode="quality"><div class="t">🎧 高质量模式</div><div class="d">depth FP32 版 · 约慢 2.5 倍</div></div>
+    <div class="mode active" data-mode="fast"><div class="t">⚡ 快速（模型常驻）</div><div class="d">免加载 · 5 s 语音约 50–60 s</div></div>
+    <div class="mode" data-mode="quality"><div class="t">🎧 高质量模式</div><div class="d">FP32 depth · 首次切换加载 ~15 s，约慢 2×</div></div>
   </div>
   <div class="actions">
     <button class="btn" id="go">生成语音</button>
     <button class="btn ghost small" id="stop" style="display:none">取消</button>
-    <span class="hint" id="hint">首次请求需加载模型（约 10–15 s）；5 s 语音约需 60–80 s。</span>
+    <span class="hint" id="hint">模型已常驻内存：5 s 语音约 50–60 s（RTF≈8–9×）；高质量模式需重新加载。</span>
   </div>
 
   <div class="progress" id="prog">
@@ -161,6 +162,8 @@ async function refreshHealth(){
     const c=h.cmm||{};
     $('#bCmm').innerHTML='CMM <b>'+fmt(c.used_mb,0)+'</b> / '+fmt(c.total_mb,0)+' MB';
     $('#bQueue').innerHTML='队列 <b>'+(h.queue||0)+'</b>';
+    const w=(h.warm||{});
+    $('#bWarm').innerHTML='常驻 '+(w.state==='ready'?'<b>已就绪</b>'+(w.load_s?' '+w.load_s+'s':''):(w.state==='loading'?'<b>加载中</b>':(w.state==='error'?'<b style="color:#ff6b6b">失败</b>':'关闭')));
   }catch(e){$('#bStatus').textContent='● 服务异常';}
 }
 async function loadPresets(){
@@ -218,16 +221,17 @@ function onDone(j){
   $('#dl').href=j.download_url;
   $('#tokDl').href=j.tokens_url;
   $('#rTag').textContent = j.n_frames? (j.n_frames+' 帧'):'完成';
-  $('#rMeta').textContent = (j.mode==='quality'?'高质量模式':'快速模式')+' · '+(j.audio_sec?fmt(j.audio_sec,2)+' s 音频':'')+' · 总耗时 '+fmt(j.elapsed,1)+' s';
+  const eng = j.engine_used==='warm' ? '常驻引擎' : '子进程';
+  $('#rMeta').textContent = (j.mode==='quality'?'高质量':'快速')+' · '+eng+' · '+(j.audio_sec?fmt(j.audio_sec,2)+' s 音频':'')+' · 总耗时 '+fmt(j.elapsed,1)+' s';
   const t=j.timings||{};
   const cells=[
     ['总耗时', fmt(j.elapsed,1)+' s'],
     ['音频时长', fmt(j.audio_sec,2)+' s'],
     ['RTF', fmt(j.rtf,2)+'×'],
-    ['talker/frame', fmt(t.talker_decode?(t.talker_decode/j.n_frames):(t['talker_decode']),1)+' ms'],
-    ['depth/frame', fmt(t.depth_15steps?(t.depth_15steps/j.n_frames):(t['depth_15steps']),1)+' ms'],
-    ['prefill', fmt(t.talker_prefill,1)+' ms'],
-    ['textenc', fmt(t.textenc,1)+' ms'],
+    ['talker/frame', fmt(t.talker_decode/j.n_frames,1)+' ms'],
+    ['depth/frame', fmt(t.depth_15steps/j.n_frames,1)+' ms'],
+    ['prefill', fmt(t.talker_prefill_s,1)+' ms'],
+    ['textenc', fmt(t.textenc_s,1)+' ms'],
     ['codec', fmt(t.codec_decode,1)+' ms'],
   ];
   $('#kv').innerHTML=cells.map(([k,v])=>'<div><span>'+k+'</span><b>'+v+'</b></div>').join('');
@@ -255,7 +259,7 @@ function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':
 $('#go').onclick=submit;
 $('#stop').onclick=async()=>{if(!curJob)return; try{await jpost('/api/jobs/'+encodeURIComponent(curJob)+'/cancel');}catch(e){}};
 $('#text').addEventListener('input',()=>{
-  const n=$('#text').value.length; $('#hint').textContent='已输入 '+n+' / 300 字 · 首次请求需加载模型（约 10–15 s）；5 s 语音约需 60–80 s。';
+  const n=$('#text').value.length; $('#hint').textContent='已输入 '+n+' / 300 字 · 模型常驻，5 s 语音约 50–60 s（RTF≈8–9×）。';
 });
 loadPresets().catch(()=>{});
 loadHistory();

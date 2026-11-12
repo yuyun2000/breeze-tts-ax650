@@ -41,6 +41,44 @@ queue_cv = threading.Condition()
 _recent = deque(maxlen=30)
 
 
+# ---------------- 常驻（warm）推理引擎 ----------------
+WARM_ENABLED = os.environ.get("BREEZE_WARM", "1") == "1"
+warm = {"state": "off", "engine": None, "load_s": None, "err": "", "loaded_at": None}
+warm_lock = threading.Lock()
+
+
+def _warm_loader():
+    if not WARM_ENABLED:
+        warm["state"] = "off"
+        return
+    with warm_lock:
+        warm["state"] = "loading"
+    print("[warm] loading resident engine ...", flush=True)
+    try:
+        import breeze_warm_engine as we
+        t0 = now()
+        eng = we.WarmEngine(log=lambda m: print("[warm] %s" % m, flush=True))
+        with warm_lock:
+            warm["engine"] = eng
+            warm["state"] = "ready"
+            warm["load_s"] = round(now() - t0, 1)
+            warm["loaded_at"] = now()
+        print("[warm] resident engine ready in %.1fs" % warm["load_s"], flush=True)
+    except Exception as e:
+        with warm_lock:
+            warm["state"] = "error"
+            warm["err"] = "%r" % e
+        print("[warm] load failed: %r" % e, flush=True)
+
+
+def _warm_snapshot():
+    with warm_lock:
+        return {"state": warm["state"], "load_s": warm["load_s"], "err": warm["err"],
+                "enabled": WARM_ENABLED,
+                "loaded_at": (time.strftime("%H:%M:%S", time.localtime(warm["loaded_at"]))
+                              if warm["loaded_at"] else None)}
+
+
 def now():
     return time.time()
 
@@ -170,7 +208,7 @@ def _worker():
             job["finished"] = now()
 
 
-def _run_job(job):
+def _run_job_subprocess(job):
     logd = os.path.dirname(job["log"])
     cmd = [PYTHON, RUNTIME,
            "--preset", "breeze",
@@ -243,6 +281,108 @@ def _run_job(job):
     job["stage"] = "完成"
 
 
+
+class _JobCancelled(Exception):
+    pass
+
+
+def _run_job(job):
+    """优先走常驻引擎（fast 模式）；未就绪/失败则回退子进程。"""
+    if WARM_ENABLED:
+        t0 = now()
+        while True:
+            with warm_lock:
+                wst = warm["state"]
+            if wst != "loading":
+                break
+            job["stage"] = "等待常驻模型加载"
+            job["elapsed"] = round(now() - t0, 1)
+            if now() - t0 > 180:
+                break
+            time.sleep(0.5)
+        if wst == "ready":
+            try:
+                _run_job_warm(job)
+                return
+            except _JobCancelled:
+                job["state"] = "cancelled"
+                job["stage"] = "已取消"
+                job["finished"] = now()
+                return
+            except Exception as e:
+                job["error"] = "常驻引擎失败: %r（回退每请求子进程）" % e
+                job["stage"] = "回退子进程模式"
+                print("[job %s] warm failed: %r" % (job["id"], e), flush=True)
+    _run_job_subprocess(job)
+
+
+def _run_job_warm(job):
+    import breeze_warm_engine as we
+    with warm_lock:
+        eng = warm["engine"]
+    if eng is None:
+        raise RuntimeError("warm engine not ready")
+    job["state"] = "running"
+    job["started"] = now()
+    job["stage"] = "文本编码器"
+    job["engine_used"] = "warm"
+    t0 = now()
+    logf = open(job["log"], "w")
+
+    def log(msg):
+        try:
+            logf.write(str(msg) + "\n")
+            logf.flush()
+        except Exception:
+            pass
+        job["log_tail"] = str(msg)[-240:]
+
+    def on_progress(n, talker_ms, depth_ms):
+        job["frames"] = int(n)
+        job["stage"] = "生成音频帧 %d" % int(n)
+        job["elapsed"] = round(now() - job["started"], 1)
+
+    try:
+        r = eng.synth(job["text"], job["instruction"], "S0", job["wav"],
+                      max_frames=job["max_frames"], seed=job["seed"],
+                      dump_tokens=job["tokens"],
+                      quality=(job["mode"] == "quality"),
+                      should_cancel=lambda: bool(job["cancel"]),
+                      on_progress=on_progress, log=log)
+    finally:
+        logf.close()
+    job["elapsed"] = round(now() - job["started"], 1)
+    job["finished"] = now()
+    if job.get("cancel"):
+        job["state"] = "cancelled"
+        return
+    tm = r["timings"]
+    job["timings"] = {
+        "RTF_x": round(float(tm.get("rtf", 0.0)), 2),
+        "textenc_s": round(tm.get("textenc_s", 0.0) * 1000, 1),
+        "talker_prefill_s": round(tm.get("talker_prefill_s", 0.0) * 1000, 1),
+        "talker_decode": round(tm.get("talker_decode_s", 0.0) * 1000, 1),
+        "depth_15steps": round(tm.get("depth_s", 0.0) * 1000, 1),
+        "codec_decode": round(tm.get("codec_decode_s", 0.0) * 1000, 1),
+        "total": round(tm.get("total_s", 0.0) * 1000, 1),
+    }
+    job["n_frames"] = int(r["n_frames"])
+    job["eos_hit"] = bool(r["eos_hit"])
+    job["audio_sec"] = float(r["audio_sec"]) or None
+    if job["audio_sec"]:
+        job["rtf"] = round(job["elapsed"] / job["audio_sec"], 2)
+    if not os.path.exists(job["wav"]):
+        raise RuntimeError("wav not produced")
+    job["state"] = "done"
+    job["stage"] = "完成"
+    if job["mode"] == "quality":
+        # 任务完成即切回 fast depth，释放 ~1.3GB CMM（下一次 quality 会再切换，代价 ~15s）
+        try:
+            eng.ensure_cp(quality=False, log=lambda m: print("[warm] %s" % m, flush=True))
+        except Exception as e:
+            print("[warm] revert to fast failed: %r" % e, flush=True)
+
+
 def _graceful_stop(proc):
     """先 SIGINT（让 Python 清理 axengine 会话，避免 CMM 泄漏），再 SIGTERM/SIGKILL。"""
     for sig, wait in ((signal.SIGINT, 8.0), (signal.SIGTERM, 5.0), (signal.SIGKILL, 3.0)):
@@ -266,6 +406,7 @@ def _job_view(job, full=False):
     d = {k: job[k] for k in ("id", "text", "instruction", "mode", "state", "stage",
                              "elapsed", "frames", "error", "timings", "audio_sec",
                              "n_frames", "rtf", "seed", "max_frames")}
+    d["engine_used"] = job.get("engine_used", "subprocess")
     d["has_audio"] = os.path.exists(job["wav"])
     d["has_tokens"] = os.path.exists(job["tokens"])
     d["audio_url"] = "/api/jobs/%s/audio.wav" % job["id"]
@@ -298,6 +439,7 @@ def health():
         "model": "Breeze TTS 2 (3.45B) · AX650 全 NPU",
         "cmm": _cmm_info(), "mem": _meminfo(),
         "queue": len(job_queue), "jobs": states, "uptime_s": round(now() - START_TIME, 1),
+        "warm": _warm_snapshot(),
     })
 
 
@@ -306,8 +448,8 @@ def api_presets():
     return jsonify({
         "instructions": INSTRUCTION_PRESETS,
         "modes": [
-            {"id": "fast", "label": "快速", "desc": "depth INT8 + U16 lm_head，约 12-16× 实时"},
-            {"id": "quality", "label": "高质量", "desc": "depth FP32 版，约 2.5× 慢"},
+            {"id": "fast", "label": "快速（常驻）", "desc": "模型常驻内存，免加载；5s 音频约 50-60s"},
+            {"id": "quality", "label": "高质量", "desc": "FP32 depth（每请求重新加载），约 2.5× 慢"},
         ],
         "default_text": "你好，欢迎体验 AX650 上的 Breeze TTS 语音合成。",
         "samples": [
@@ -407,6 +549,8 @@ def api_log(jid):
 
 START_TIME = time.time()
 threading.Thread(target=_worker, daemon=True).start()
+if WARM_ENABLED:
+    threading.Thread(target=_warm_loader, daemon=True).start()
 
 if __name__ == "__main__":
     print("[breeze-web] listening on 0.0.0.0:%d" % PORT)
