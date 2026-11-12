@@ -6,6 +6,10 @@ Artificial Analysis TTS 榜单开源第一）转换并部署到 **AX650/AX8850 N
 
 > 🤗 **模型包（axmodel + runtime，约 4.5 GB）**：<https://huggingface.co/yunyu1258/breeze-tts-2-ax650>
 >
+> 🎯 **目标芯片**：本仓库所有转换与实测都在 **AX8850**（AX650 同包兼容）上完成；下一代 **AX8860**
+> （256 TOPS / 128 GB LPDDR5X，2026-10 发布）的预估速度、内存与部署指引见
+> **[docs/ax8860-forecast.md](docs/ax8860-forecast.md)**——AX8860 到手后按文末回填表用真实数据揭晓。
+>
 > ⚠️ **许可证**：Breeze TTS 2 的**模型权重、衍生模型与自托管输出仅限研究与非商业用途**
 > （BreezeBlue Research and Non-Commercial License 1.1，见 [licenses/BREEZEBLUE_LICENSE.txt](licenses/BREEZEBLUE_LICENSE.txt)）。
 > 本仓库**代码**为 Apache-2.0（[LICENSE](LICENSE)）；本仓库/HF 发布的 axmodel 是 Breeze 权重的**衍生模型**，
@@ -86,7 +90,7 @@ python3 runtime/run_breeze_tts.py \
 ```
 scripts/convert/   重打包 (repack_breeze.py) + 文本编码器导出 + pulsar2 编译脚本
 scripts/board/     板端 runtime + 对拍/校验工具
-docs/              架构 / 转换 / 板端部署 / 经验 / 参考生成规格 (ref/)
+docs/              架构 / 转换 / 板端部署 / 经验 / AX8860 预估 (ax8860-forecast.md) / 参考生成规格 (ref/)
 reports/           conversion.md / board.md（实测数字）
 models/            模型包结构说明 + configuration.json
 ```
