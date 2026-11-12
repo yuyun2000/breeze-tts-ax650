@@ -44,6 +44,28 @@ demo wav 在 HF 包 `demos/`（4 条 fast + 1 条 quality 对照）。
 
 ## 3. 上手
 
+### 局域网网页体验（板端自托管服务）
+
+```bash
+# 板端：模型包就位后启动 Web 服务（API + 页面都在板子上，客户端只需浏览器）
+cp -r web/{breeze_web.py,start.sh,static} /root/breeze-tts/web/   # 或直接从本仓库复制
+cd /root/breeze-tts/web && bash start.sh
+# 浏览器打开 http://<板卡IP>:8010/  → 输入文本/选音色风格/生成，可试听与下载 WAV
+```
+
+| 接口 | 说明 |
+|---|---|
+| `GET /` | 网页 UI |
+| `GET /health` | 服务/CMM/队列状态 |
+| `POST /api/tts` | `{text, instruction, mode}` → job id |
+| `GET /api/jobs/<id>` | 进度 + 耗时分解（含 RTF、逐帧耗时） |
+| `GET /api/jobs/<id>/audio.wav` | 下载 WAV |
+
+详见 [web/README.md](web/README.md)。实测：一句 4.7–6.2 s 音频约 **67–82 s**（RTF 13–14×，全 NPU），
+单 worker 串行队列；页面上有示例音频可先试听。
+
+### 命令行 / Python 调用
+
 ```bash
 # 1) 下载模型包
 export HF_ENDPOINT=https://hf-mirror.com
